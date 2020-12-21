@@ -180,6 +180,7 @@ static int srpc_get_slot(struct sbw_session *s)
 		s->slots[slot] = smalloc(sizeof(struct sbw_ctx));
 		s->slots[slot]->cmn.s = (struct srpc_session *)s;
 		s->slots[slot]->cmn.idx = slot;
+		s->slots[slot]->cmn.ds_win = 0;
 	}
 	return slot;
 }
@@ -250,6 +251,8 @@ static int srpc_send_completion_vector(struct sbw_session *s,
 		shdr[nrhdr].len = len;
 		shdr[nrhdr].id = c->cmn.id;
 		shdr[nrhdr].win = (uint64_t)s->win;
+		if (c->cmn.ds_win > 0)
+			shdr[nrhdr].win = MIN(shdr[nrhdr].win, c->cmn.ds_win);
 		shdr[nrhdr].ts_sent = c->ts_sent;
 		shdr[nrhdr].flags = flags;
 

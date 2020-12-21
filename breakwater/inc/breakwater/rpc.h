@@ -30,6 +30,7 @@ struct srpc_ctx {
 	size_t			resp_len;
 	char			req_buf[SRPC_BUF_SIZE];
 	char			resp_buf[SRPC_BUF_SIZE];
+	uint64_t		ds_win;
 };
 
 typedef void (*srpc_fn_t)(struct srpc_ctx *ctx);
@@ -56,9 +57,15 @@ struct srpc_ops {
  */
 
 #define CRPC_QLEN		16
+#define CRPC_MAX_REPLICA	256
+
+struct crpc_conn {
+	tcpconn_t		*c;
+};
 
 struct crpc_session {
-	tcpconn_t		*c;
+	struct crpc_conn	*c[CRPC_MAX_REPLICA];
+	int			nconns;
 };
 
 struct crpc_ctx {
@@ -69,6 +76,14 @@ struct crpc_ctx {
 };
 
 struct crpc_ops {
+	/** crpc_add_connection - add a connection to a replica
+	 *  @s: the RPC session to add connection to
+	 *  @raddr: the remote address of replica (port must be SRPC_PORT)
+	 *
+	 *  Returns 0 if successful.
+	 */
+	int (*crpc_add_connection)(struct crpc_session *s, struct netaddr raddr);
+
 	/**
 	 * crpc_send_one - sends one RPC request
 	 * @s: the RPC session to send to
@@ -95,7 +110,7 @@ struct crpc_ops {
 	 * On success, returns the length received in bytes. On failure returns standard
 	 * socket errors (<= 0).
 	 */
-	ssize_t (*crpc_recv_one)(struct crpc_session *s,
+	ssize_t (*crpc_recv_one)(struct crpc_conn *s,
 				 void *buf, size_t len, uint64_t *latency);
 
 	/**

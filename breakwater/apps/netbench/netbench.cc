@@ -18,6 +18,7 @@ extern "C" {
 
 #include "synthetic_worker.h"
 
+#include <atomic>
 #include <algorithm>
 #include <chrono>
 #include <fstream>
@@ -51,7 +52,10 @@ using sec = duration<double, std::micro>;
 // the number of worker threads to spawn.
 int threads;
 // the remote UDP address of the server.
-netaddr raddr, master;
+int num_servers;
+int nconn[16];
+netaddr raddr[16];
+netaddr master;
 // the mean service time in us.
 double st;
 // service time distribution type
@@ -78,6 +82,9 @@ std::vector<double> offered_loads;
 double offered_load;
 
 static SyntheticWorker *workers[NCPU];
+
+struct lb_ctx;
+rpc::RpcClient *lb_client;
 
 /* server-side stat */
 constexpr uint64_t kRPCSStatPort = 8002;
@@ -179,11 +186,13 @@ class NetBarrier {
       conns.emplace_back(c);
       BUG_ON(c->WriteFull(&threads, sizeof(threads)) <= 0);
       BUG_ON(c->WriteFull(&st, sizeof(st)) <= 0);
-      BUG_ON(c->WriteFull(&raddr, sizeof(raddr)) <= 0);
       BUG_ON(c->WriteFull(&total_agents, sizeof(total_agents)) <= 0);
       BUG_ON(c->WriteFull(&st_type, sizeof(st_type)) <= 0);
       BUG_ON(c->WriteFull(&slo, sizeof(slo)) <= 0);
       BUG_ON(c->WriteFull(&offered_load, sizeof(offered_load)) <= 0);
+      BUG_ON(c->WriteFull(&num_servers, sizeof(num_servers)) <= 0);
+      BUG_ON(c->WriteFull(raddr, sizeof(netaddr) * num_servers) <= 0);
+      BUG_ON(c->WriteFull(nconn, sizeof(int) * num_servers) <= 0);
       for (size_t j = 0; j < npara; j++) {
         rt::TcpConn *c = aggregator_->Accept();
         if (c == nullptr) panic("couldn't accept a connection");
@@ -199,11 +208,13 @@ class NetBarrier {
     is_leader_ = false;
     BUG_ON(c->ReadFull(&threads, sizeof(threads)) <= 0);
     BUG_ON(c->ReadFull(&st, sizeof(st)) <= 0);
-    BUG_ON(c->ReadFull(&raddr, sizeof(raddr)) <= 0);
     BUG_ON(c->ReadFull(&total_agents, sizeof(total_agents)) <= 0);
     BUG_ON(c->ReadFull(&st_type, sizeof(st_type)) <= 0);
     BUG_ON(c->ReadFull(&slo, sizeof(slo)) <= 0);
     BUG_ON(c->ReadFull(&offered_load, sizeof(offered_load)) <= 0);
+    BUG_ON(c->ReadFull(&num_servers, sizeof(num_servers)) <= 0);
+    BUG_ON(c->ReadFull(raddr, sizeof(netaddr) * num_servers) <= 0);
+    BUG_ON(c->ReadFull(nconn, sizeof(int) * num_servers) <= 0);
     for (size_t i = 0; i < npara; i++) {
       auto c = rt::TcpConn::Dial({0, 0}, {master.ip, kBarrierPort + 1});
       BUG_ON(c == nullptr);
@@ -371,7 +382,7 @@ void RPCSStatServer() {
 
 sstat_raw ReadRPCSStat() {
   std::unique_ptr<rt::TcpConn> c(
-      rt::TcpConn::Dial({0, 0}, {raddr.ip, kRPCSStatPort}));
+      rt::TcpConn::Dial({0, 0}, {raddr[0].ip, kRPCSStatPort}));
   uint64_t magic = hton64(kRPCSStatMagic);
   ssize_t ret = c->WriteFull(&magic, sizeof(magic));
   if (ret != static_cast<ssize_t>(sizeof(magic)))
@@ -389,7 +400,7 @@ shstat_raw ReadShenangoStat() {
   std::string buf;
   std::map<std::string, uint64_t> smap;
   std::unique_ptr<rt::TcpConn> c(
-      rt::TcpConn::Dial({0, 0}, {raddr.ip, kShenangoStatPort}));
+      rt::TcpConn::Dial({0, 0}, {raddr[0].ip, kShenangoStatPort}));
   uint64_t magic = hton64(kShenangoStatMagic);
   ssize_t ret = c->WriteFull(&magic, sizeof(magic));
   if (ret != static_cast<ssize_t>(sizeof(magic)))
@@ -487,6 +498,100 @@ void ServerHandler(void *arg) {
   rt::WaitGroup(1).Wait();
 }
 
+struct lb_ctx {
+  payload req;
+  payload resp;
+  rt::WaitGroup *waiter;
+};
+
+void LoadBalancer(struct srpc_ctx *ctx) {
+  // Validate and parse the request
+  if (unlikely(ctx->req_len != sizeof(payload))) {
+    log_err("got invalid RPC len %ld", ctx->req_len);
+    return;
+  }
+  const payload *in = reinterpret_cast<const payload *>(ctx->req_buf);
+
+  // Craft sub-req
+  lb_ctx ds_ctx;
+  rt::WaitGroup resp_waiter(1);
+
+  memcpy(&ds_ctx.req, in, sizeof(ds_ctx.req));
+  ds_ctx.req.index = hton64(reinterpret_cast<uint64_t>(&ds_ctx));
+  ds_ctx.waiter = &resp_waiter;
+
+  // Call to downstream
+  lb_client->Send(&ds_ctx.req, sizeof(ds_ctx.req), 0);
+
+  // Wait for the response
+  resp_waiter.Wait();
+
+  // Craft a response
+  ctx->resp_len = sizeof(payload);
+  ctx->ds_win = lb_client->WinAvail();
+  payload *out = reinterpret_cast<payload *>(ctx->resp_buf);
+  memcpy(out, in, sizeof(*out));
+  out->success = ds_ctx.resp.success;
+  out->tsc_end = hton64(rdtscp(&out->cpu));
+  out->cpu = hton32(out->cpu);
+  out->server_queue = hton64(rt::RuntimeQueueUS());
+}
+
+void LBHandler(void *arg) {
+  rt::Thread([] { RPCSStatServer(); }).Detach();
+  int server_idx;
+  int conn_idx;
+  /* Dial to the first connection */
+  lb_client = rpc::RpcClient::Dial(raddr[0], 1);
+
+  /* Add connections to the replica */
+  if (nconn[0] > 1) {
+    server_idx = 0;
+    conn_idx = 1;
+  } else {
+    server_idx = 1;
+    conn_idx = 0;
+  }
+
+  while (server_idx < num_servers) {
+    lb_client->AddConnection(raddr[server_idx]);
+    if (++conn_idx >= nconn[server_idx]) {
+      server_idx++;
+      conn_idx = 0;
+    }
+  }
+
+  // Start the receiver thread for downstream
+  for(int i = 0; i < lb_client->NumConns(); ++i) {
+    rt::Thread([&, i] {
+      payload rp;
+
+      while (true) {
+        ssize_t ret = lb_client->Recv(&rp, sizeof(rp), i, nullptr);
+	if (ret != static_cast<ssize_t>(sizeof(rp))) {
+	  if (ret == 0 || ret < 0) break;
+	  panic("read failed, ret = %ld", ret);
+	}
+
+	uint64_t idx = ntoh64(rp.index);
+	lb_ctx *ctx = reinterpret_cast<lb_ctx *>(idx);
+
+	/* copy response */
+	memcpy(&ctx->resp, &rp, sizeof(rp));
+
+	/* wake up request */
+	ctx->waiter->Done();
+      }
+    }).Detach();
+  }
+
+  /* Start Server */
+  int ret = rpc::RpcServerEnable(LoadBalancer);
+  if (ret) panic("couldn't start LB server");
+  // waits forever.
+  rt::WaitGroup(1).Wait();
+}
+
 template <class Arrival, class Service>
 std::vector<work_unit> GenerateWork(Arrival a, Service s, double cur_us,
                                     double last_us) {
@@ -530,36 +635,40 @@ std::vector<work_unit> ClientWorker(
   std::vector<uint64_t> timings;
   timings.reserve(w.size());
 
+  std::vector<rt::Thread> ths;
+
   // Start the receiver thread.
-  auto th = rt::Thread([&] {
-    payload rp;
-    uint64_t latency;
+  for(int i = 0; i < c->NumConns(); ++i) {
+    ths.emplace_back(rt::Thread([&, i] {
+      payload rp;
+      uint64_t latency;
 
-    while (true) {
-      ssize_t ret = c->Recv(&rp, sizeof(rp), &latency);
-      if (ret != static_cast<ssize_t>(sizeof(rp))) {
-        if (ret == 0 || ret < 0) break;
-	panic("read failed, ret = %ld", ret);
+      while (true) {
+        ssize_t ret = c->Recv(&rp, sizeof(rp), i, &latency);
+        if (ret != static_cast<ssize_t>(sizeof(rp))) {
+          if (ret == 0 || ret < 0) break;
+          panic("read failed, ret = %ld", ret);
+        }
+
+        uint64_t now = microtime();
+        uint64_t idx = ntoh64(rp.index);
+
+        if (!rp.success) {
+          w[idx].duration_us = latency;
+          w[idx].success = false;
+          continue;
+        }
+
+        w[idx].duration_us = now - timings[idx];
+        w[idx].window = c->WinAvail();
+        w[idx].tsc = ntoh64(rp.tsc_end);
+        w[idx].cpu = ntoh32(rp.cpu);
+        w[idx].server_queue = ntoh64(rp.server_queue);
+        w[idx].server_time = w[idx].work_us + w[idx].server_queue;
+        w[idx].success = true;
       }
-
-      uint64_t now = microtime();
-      uint64_t idx = ntoh64(rp.index);
-
-      if (!rp.success) {
-        w[idx].duration_us = latency;
-        w[idx].success = false;
-	continue;
-      }
-
-      w[idx].duration_us = now - timings[idx];
-      w[idx].window = c->WinAvail();
-      w[idx].tsc = ntoh64(rp.tsc_end);
-      w[idx].cpu = ntoh32(rp.cpu);
-      w[idx].server_queue = ntoh64(rp.server_queue);
-      w[idx].server_time = w[idx].work_us + w[idx].server_queue;
-      w[idx].success = true;
-    }
-  });
+    }));
+  }
 
   // Synchronized start of load generation.
   starter->Done();
@@ -603,7 +712,8 @@ std::vector<work_unit> ClientWorker(
   // rt::Sleep(1 * rt::kSeconds);
   rt::Sleep((int)(kRTT + 2 * st));
   BUG_ON(c->Shutdown(SHUT_RDWR));
-  th.Join();
+  for (auto &th : ths)
+    th.Join();
 
   return w;
 }
@@ -612,14 +722,34 @@ std::vector<work_unit> RunExperiment(
     int threads, struct cstat_raw *csr, struct sstat *ss, double *elapsed,
     std::function<std::vector<work_unit>()> wf) {
   // Create one TCP connection per thread.
-  std::vector<std::unique_ptr<rpc::RpcClient>> conns;
+  std::vector<std::unique_ptr<rpc::RpcClient>> clients;
   sstat_raw s1, s2;
   shstat_raw sh1, sh2;
 
+  int server_idx;
+  int conn_idx;
+
   for (int i = 0; i < threads; ++i) {
-    std::unique_ptr<rpc::RpcClient> outc(rpc::RpcClient::Dial(raddr, i + 1));
+    std::unique_ptr<rpc::RpcClient> outc(rpc::RpcClient::Dial(raddr[0], i + 1));
     if (unlikely(outc == nullptr)) panic("couldn't connect to raddr.");
-    conns.emplace_back(std::move(outc));
+
+    if (nconn[0] > 1) {
+      server_idx = 0;
+      conn_idx = 1;
+    } else {
+      server_idx = 1;
+      conn_idx = 0;
+    }
+
+    while (server_idx < num_servers) {
+      outc->AddConnection(raddr[server_idx]);
+      if (++conn_idx >= nconn[server_idx]) {
+        server_idx++;
+	conn_idx = 0;
+      }
+    }
+
+    clients.emplace_back(std::move(outc));
   }
 
   // Launch a worker thread for each connection.
@@ -630,7 +760,7 @@ std::vector<work_unit> RunExperiment(
   std::unique_ptr<std::vector<work_unit>> samples[threads];
   for (int i = 0; i < threads; ++i) {
     th.emplace_back(rt::Thread([&, i] {
-      auto v = ClientWorker(conns[i].get(), &starter, &starter2, wf);
+      auto v = ClientWorker(clients[i].get(), &starter, &starter2, wf);
       samples[i].reset(new std::vector<work_unit>(std::move(v)));
     }));
   }
@@ -667,14 +797,14 @@ std::vector<work_unit> RunExperiment(
   }
 
   // Force the connections to close.
-  for (auto &c : conns) c->Abort();
+  for (auto &c : clients) c->Abort();
 
   double elapsed_ = duration_cast<sec>(finish - start).count();
   elapsed_ -= kWarmUpTime;
 
   // Aggregate client stats
   if (csr) {
-    for (auto &c : conns) {
+    for (auto &c : clients) {
       csr->winu_rx += c->StatWinuRx();
       csr->winu_tx += c->StatWinuTx();
       csr->resp_rx += c->StatRespRx();
@@ -1150,8 +1280,34 @@ void ClientHandler(void *arg) {
 
 }  // anonymous namespace
 
+void print_lb_usage() {
+  std::cerr << "usage: [alg] [cfg_file] lb [server_ip #1] [nconn #1]\n"
+	    << "\talg: overload control algorithms (breakwater/seda/dagor)\n"
+	    << "\tcfg_file: Shenango configuration file\n"
+	    << "\tserver_ip: server IP address\n"
+	    << "\tnconn: the number of parallel connection to the server"
+	    << std:: endl;
+}
+
+void print_client_usage() {
+  std::cerr << "usage: [alg] [cfg_file] client [nclients] "
+      << "[service_us] [service_dist] [slo] [nagents] "
+      << "[offered_load] [server_ip #1] [nconn #1] ...\n"
+      << "\talg: overload control algorithms (breakwater/seda/dagor)\n"
+      << "\tcfg_file: Shenango configuration file\n"
+      << "\tnclients: the number of client connections\n"
+      << "\tservice_us: average request processing time (in us)\n"
+      << "\tservice_dist: request processing time distribution (exp/const/bimod)\n"
+      << "\tslo: RPC service level objective (in us)\n"
+      << "\tnagents: the number of agents\n"
+      << "\toffered_load: load geneated by client and agents in requests per second\n"
+      << "\tserver_ip: server IP address\n"
+      << "\tnconn: the number of parallel connection to the server"
+      << std::endl;
+}
+
 int main(int argc, char *argv[]) {
-  int ret;
+  int ret, i;
 
   if (argc < 4) {
     std::cerr << "usage: [alg] [cfg_file] [cmd] ...\n"
@@ -1185,23 +1341,55 @@ int main(int argc, char *argv[]) {
 
   std::string cmd = argv[3];
   if (cmd.compare("server") == 0) {
+    // Server
     ret = runtime_init(argv[2], ServerHandler, NULL);
     if (ret) {
       printf("failed to start runtime\n");
       return ret;
     }
   } else if (cmd.compare("agent") == 0) {
+    // Agent
     if (argc < 5 || StringToAddr(argv[4], &master.ip)) {
-    std::cerr << "usage: [alg] [cfg_file] agent [client_ip]\n"
-	      << "\talg: overload control algorithms (breakwater/seda/dagor)\n"
-	      << "\tcfg_file: Shenango configuration file\n"
-	      << "\tclient_ip: Client IP address" << std::endl;
+      std::cerr << "usage: [alg] [cfg_file] agent [client_ip]\n"
+	        << "\talg: overload control algorithms (breakwater/seda/dagor)\n"
+		<< "\tcfg_file: Shenango configuration file\n"
+		<< "\tclient_ip: Client IP address" << std::endl;
       return -EINVAL;
     }
 
     ret = runtime_init(argv[2], AgentHandler, NULL);
     if (ret) {
       printf("failed to start runtime\n");
+      return ret;
+    }
+  } else if (cmd.compare("lb") == 0) {
+    // Load-Balancer
+    if (argc < 6) {
+      print_lb_usage();
+      return -EINVAL;
+    }
+
+    num_servers = argc - 4;
+    if (num_servers % 2 != 0) {
+      print_lb_usage();
+      return -EINVAL;
+    }
+    num_servers /= 2;
+
+    for (i = 0; i < num_servers; ++i) {
+      ret = StringToAddr(argv[4+2*i], &raddr[i].ip);
+      if (ret) {
+        std::cerr << "[Error] Cannot parse server IP: " << argv[4+2*i]
+		  << std::endl;
+	return -EINVAL;
+      }
+      raddr[i].port = kNetbenchPort;
+      nconn[i] = std::stoi(argv[5+2*i], nullptr, 0);
+    }
+
+    ret = runtime_init(argv[2], LBHandler, NULL);
+    if (ret) {
+      std::cerr << "[Error] Failed to start runtime" << std::endl;
       return ret;
     }
   } else if (cmd.compare("client") != 0) {
@@ -1214,31 +1402,14 @@ int main(int argc, char *argv[]) {
   }
 
   if (argc < 11) {
-    std::cerr << "usage: [alg] [cfg_file] client [nclients] "
-		 "[server_ip] [service_us] [service_dist] [slo] [nagents] "
-		 "[offered_load]\n"
-	      << "\talg: overload control algorithms (breakwater/seda/dagor)\n"
-	      << "\tcfg_file: Shenango configuration file\n"
-	      << "\tnclients: the number of client connections\n"
-	      << "\tserver_ip: server IP address\n"
-	      << "\tservice_us: average request processing time (in us)\n"
-	      << "\tservice_dist: request processing time distribution (exp/const/bimod)\n"
-	      << "\tslo: RPC service level objective (in us)\n"
-	      << "\tnagents: the number of agents\n"
-	      << "\toffered_load: load geneated by client and agents in requests per second"
-	      << std::endl;
+    print_client_usage();
     return -EINVAL;
   }
 
   threads = std::stoi(argv[4], nullptr, 0);
+  st = std::stod(argv[5], nullptr);
 
-  ret = StringToAddr(argv[5], &raddr.ip);
-  if (ret) return -EINVAL;
-  raddr.port = kNetbenchPort;
-
-  st = std::stod(argv[6], nullptr);
-
-  std::string st_dist = argv[7];
+  std::string st_dist = argv[6];
   if (st_dist.compare("exp") == 0) {
     st_type = 1;
   } else if (st_dist.compare("const") == 0) {
@@ -1247,24 +1418,46 @@ int main(int argc, char *argv[]) {
     st_type = 3;
   } else {
     std::cerr << "invalid service time distribution: " << st_dist << std::endl;
-    std::cerr << "usage: [alg] [cfg_file] client [nclients] "
-		 "[server_ip] [service_us] [service_dist] [slo] [nagents] "
-		 "[offered_load]\n"
-	      << "\talg: overload control algorithms (breakwater/seda/dagor)\n"
-	      << "\tcfg_file: Shenango configuration file\n"
-	      << "\tnclients: the number of client connections\n"
-	      << "\tserver_ip: server IP address\n"
-	      << "\tservice_us: average request processing time (in us)\n"
-	      << "\tservice_dist: request processing time distribution (exp/const/bimod)\n"
-	      << "\tslo: RPC service level objective (in us)\n"
-	      << "\tnagents: the number of agents\n"
-	      << "\toffered_load: load generated by client and agents in requests per second"
-	      << std::endl;
+    print_client_usage();
+    return -EINVAL;
   }
 
-  slo = std::stoi(argv[8], nullptr, 0);
-  total_agents += std::stoi(argv[9], nullptr, 0);
-  offered_load = std::stod(argv[10], nullptr);
+  slo = std::stoi(argv[7], nullptr, 0);
+  total_agents += std::stoi(argv[8], nullptr, 0);
+  offered_load = std::stod(argv[9], nullptr);
+
+  num_servers = argc - 10;
+  if (num_servers % 2 != 0) {
+    print_client_usage();
+    return -EINVAL;
+  }
+  num_servers /= 2;
+
+  if (num_servers > 16) {
+    std::cerr << "[Warning] the number of server exceeds 16."
+	      << std::endl;
+    num_servers = 16;
+  }
+
+  for(i = 0; i < num_servers; ++i) {
+    int nconn_;
+
+    ret = StringToAddr(argv[10+2*i], &raddr[i].ip);
+    if (ret) {
+      std::cerr << "[Error] Cannot parse server IP:" << argv[10+2*i]
+	        << std::endl;
+      return -EINVAL;
+    }
+    raddr[i].port = kNetbenchPort;
+
+    nconn_ = std::stoi(argv[11+2*i], nullptr, 0);
+    if (nconn_ > 16) {
+      std::cerr << "[Warning] the number of parallel connection exceeds 16."
+	        << std::endl;
+      nconn_ = 16;
+    }
+    nconn[i] = nconn_;
+  }
 
   ret = runtime_init(argv[2], ClientHandler, NULL);
   if (ret) {

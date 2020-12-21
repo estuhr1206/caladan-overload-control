@@ -20,13 +20,22 @@ RpcClient *RpcClient::Dial(netaddr raddr, int id) {
   return new RpcClient(s);
 }
 
+int RpcClient::AddConnection(netaddr raddr) {
+  raddr.port = SRPC_PORT;
+  return crpc_ops->crpc_add_connection(s_, raddr);
+}
+
 ssize_t RpcClient::Send(const void *buf, size_t len, int hash) {
   return crpc_ops->crpc_send_one(s_, buf, len, hash);
 }
 
-ssize_t RpcClient::Recv(void *buf, size_t len,
-			uint64_t *latency = nullptr) {
-  return crpc_ops->crpc_recv_one(s_, buf, len, latency);
+ssize_t RpcClient::Recv(void *buf, size_t len, int conn_idx,
+			uint64_t *latency) {
+  return crpc_ops->crpc_recv_one(s_->c[conn_idx], buf, len, latency);
+}
+
+int RpcClient::NumConns() {
+  return s_->nconns;
 }
 
 uint32_t RpcClient::WinAvail() {
@@ -62,11 +71,19 @@ uint64_t RpcClient::StatReqDropped() {
 }
 
 int RpcClient::Shutdown(int how) {
-  return tcp_shutdown(s_->c, how);
+  int ret = 0;
+
+  for(int i = 0; i < s_->nconns; ++i) {
+    ret |= tcp_shutdown(s_->c[i]->c, how);
+  }
+
+  return ret;
 }
 
 void RpcClient::Abort() {
-  tcp_abort(s_->c);
+  for(int i = 0; i < s_->nconns; ++i) {
+    tcp_abort(s_->c[i]->c);
+  }
 }
 
 void RpcClient::Close() {

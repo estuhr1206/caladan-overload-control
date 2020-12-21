@@ -21,48 +21,48 @@
 #define CSD_TRACK_FLOW			false
 #define CSD_TRACK_FLOW_ID		1
 
-static void tb_refill_token(struct csd_session *s) {
+static void tb_refill_token(struct csd_conn *cc) {
 	double new_token;
 	uint64_t now = microtime();
 
-	assert_mutex_held(&s->lock);
+	assert_mutex_held(&cc->lock);
 
-	if (s->tb_last_refresh == 0) {
-		s->tb_last_refresh = now;
-		s->tb_token = 0;
+	if (cc->tb_last_refresh == 0) {
+		cc->tb_last_refresh = now;
+		cc->tb_token = 0;
 		return;
 	}
 
-	new_token = (now - s->tb_last_refresh) * s->tb_refresh_rate / 1000000.0;
-	s->tb_token += new_token;
-	s->tb_last_refresh = now;
+	new_token = (now - cc->tb_last_refresh) * cc->tb_refresh_rate / 1000000.0;
+	cc->tb_token += new_token;
+	cc->tb_last_refresh = now;
 
-	s->tb_token = MIN(s->tb_token, CSD_TB_MAX_TOKEN);
+	cc->tb_token = MIN(cc->tb_token, CSD_TB_MAX_TOKEN);
 }
 
-static void tb_set_rate(struct csd_session *s, double new_rate)
+static void tb_set_rate(struct csd_conn *cc, double new_rate)
 {
-	assert_mutex_held(&s->lock);
-	tb_refill_token(s);
-	s->tb_refresh_rate = MAX(new_rate, CSD_TB_MIN_RATE);
+	assert_mutex_held(&cc->lock);
+	tb_refill_token(cc);
+	cc->tb_refresh_rate = MAX(new_rate, CSD_TB_MIN_RATE);
 }
 
-static void tb_sleep_until_next_token(struct csd_session *s)
+static void tb_sleep_until_next_token(struct csd_conn *cc)
 {
 	uint64_t sleep_until;
 
-	assert_mutex_held(&s->lock);
+	assert_mutex_held(&cc->lock);
 
-	sleep_until = s->tb_last_refresh +
-		(1.0 - s->tb_token) * 1000000 / s->tb_refresh_rate;
+	sleep_until = cc->tb_last_refresh +
+		(1.0 - cc->tb_token) * 1000000 / cc->tb_refresh_rate;
 
-	mutex_unlock(&s->lock);
+	mutex_unlock(&cc->lock);
 	timer_sleep_until(sleep_until + 1);
-	mutex_lock(&s->lock);
-	tb_refill_token(s);
+	mutex_lock(&cc->lock);
+	tb_refill_token(cc);
 }
 
-static ssize_t crpc_send_request_vector(struct csd_session *s)
+static ssize_t crpc_send_request_vector(struct csd_conn *cc)
 {
 	struct csd_hdr chdr[CRPC_QLEN];
 	struct iovec v[CRPC_QLEN * 2];
@@ -71,13 +71,13 @@ static ssize_t crpc_send_request_vector(struct csd_session *s)
 	ssize_t ret;
 	uint64_t now = microtime();
 
-	assert_mutex_held(&s->lock);
+	assert_mutex_held(&cc->lock);
 
-	if (s->head == s->tail || s->tb_token < 1.0)
+	if (cc->head == cc->tail || cc->tb_token < 1.0)
 		return 0;
 
-	while (s->head != s->tail && s->tb_token >= 1.0) {
-		struct crpc_ctx *c = s->qreq[s->tail++ % CRPC_QLEN];
+	while (cc->head != cc->tail && cc->tb_token >= 1.0) {
+		struct crpc_ctx *c = cc->qreq[cc->tail++ % CRPC_QLEN];
 
 		chdr[nrhdr].magic = SD_REQ_MAGIC;
 		chdr[nrhdr].op = SD_OP_CALL;
@@ -95,26 +95,26 @@ static ssize_t crpc_send_request_vector(struct csd_session *s)
 			v[nriov++].iov_len = c->len;
 		}
 
-		s->tb_token -= 1.0;
+		cc->tb_token -= 1.0;
 	}
 
-	if (s->head == s->tail) {
-		s->head = 0;
-		s->tail = 0;
+	if (cc->head == cc->tail) {
+		cc->head = 0;
+		cc->tail = 0;
 	}
 
 	if (nriov == 0)
 		return 0;
-	ret = tcp_writev_full(s->cmn.c, v, nriov);
+	ret = tcp_writev_full(cc->cmn.c, v, nriov);
 
-	s->req_tx_ += nrhdr;
+	cc->req_tx_ += nrhdr;
 
 	if (unlikely(ret < 0))
 		return ret;
 	return 0;
 }
 
-static ssize_t crpc_send_raw(struct csd_session *s,
+static ssize_t crpc_send_raw(struct csd_conn *cc,
 			     const void *buf, size_t len,
 			     uint64_t id)
 {
@@ -136,11 +136,11 @@ static ssize_t crpc_send_raw(struct csd_session *s,
 	vec[1].iov_len = len;
 
 	/* send the request */
-	ret = tcp_writev_full(s->cmn.c, vec, 2);
+	ret = tcp_writev_full(cc->cmn.c, vec, 2);
 	if (unlikely(ret < 0))
 		return ret;
 	assert(ret == sizeof(chdr) + len);
-	s->req_tx_++;
+	cc->req_tx_++;
 
 	return len;
 }
@@ -151,48 +151,251 @@ static bool crpc_enqueue_one(struct csd_session *s,
 	int pos;
 	struct crpc_ctx *c;
 	uint64_t now = microtime();
+	int conn_idx;
+	struct csd_conn *cc;
+	int i;
 
 	assert_mutex_held(&s->lock);
 
-	if (s->head - s->tail >= CRPC_QLEN) {
-		//printf("[WARNING] Request dropped due to full queue\n");
+	/* choose the connection */
+	for (i = 0; i < s->cmn.nconns; ++i) {
+		conn_idx = (s->next_conn_idx + i) % s->cmn.nconns;
+		cc = (struct csd_conn *)s->cmn.c[conn_idx];
+		if (cc->head - cc->tail < CRPC_QLEN) {
+			s->next_conn_idx = (conn_idx + 1) % s->cmn.nconns;
+			break;
+		}
+		cc = NULL;
+	}
+
+	/* if every connection is busy */
+	if (!cc) {
+		s->req_dropped_++;
 		return false;
 	}
 
-	pos = s->head++ % CRPC_QLEN;
-	c = s->qreq[pos];
+	mutex_lock(&cc->lock);
+
+	if (cc->head - cc->tail >= CRPC_QLEN) {
+		s->req_dropped_++;
+		mutex_unlock(&cc->lock);
+		return false;
+	}
+
+	pos = cc->head++ % CRPC_QLEN;
+	c = cc->qreq[pos];
 	memcpy(c->buf, buf, len);
 	c->id = s->req_id++;
 	c->ts = now;
 	c->len = len;
 
-	if (s->head - s->tail == 1) {
-		condvar_signal(&s->timer_cv);
-		condvar_signal(&s->sender_cv);
+	if (cc->head - cc->tail == 1) {
+		condvar_signal(&cc->timer_cv);
+		condvar_signal(&cc->sender_cv);
 	}
 
+	mutex_unlock(&cc->lock);
+
 	return true;
+}
+
+static void crpc_timer(void *arg)
+{
+	struct csd_conn *cc = (struct csd_conn *)arg;
+	uint64_t now;
+	int pos;
+	struct crpc_ctx *c;
+
+	mutex_lock(&cc->lock);
+	while(true) {
+		/* If queue is empty, wait for the request */
+		while (cc->running && cc->head == cc->tail)
+			condvar_wait(&cc->timer_cv, &cc->lock);
+
+		if (!cc->running)
+			goto done;
+
+		now = microtime();
+
+		/* drop the old requests */
+		while (cc->head != cc->tail) {
+			pos = cc->tail % CRPC_QLEN;
+			c = cc->qreq[pos];
+			if (now - c->ts <= CSD_MAX_CLIENT_DELAY_US)
+				break;
+
+			cc->tail++;
+			cc->req_dropped_++;
+		}
+
+		if (cc->head == cc->tail) {
+			cc->head = 0;
+			cc->tail = 0;
+			continue;
+		}
+
+		// calculate next wake up time
+		pos = (cc->head - 1) % CRPC_QLEN;
+		c = cc->qreq[pos];
+		mutex_unlock(&cc->lock);
+		timer_sleep_until(c->ts + CSD_MAX_CLIENT_DELAY_US);
+		mutex_lock(&cc->lock);
+	}
+done:
+	mutex_unlock(&cc->lock);
+	waitgroup_done(&cc->timer_waiter);
+}
+
+static void crpc_sender(void *arg)
+{
+	struct csd_conn *cc = (struct csd_conn *)arg;
+	int pos;
+	struct crpc_ctx *c;
+	uint64_t now;
+
+	mutex_lock(&cc->lock);
+	while (true) {
+		while(cc->running && cc->head == cc->tail)
+			condvar_wait(&cc->sender_cv, &cc->lock);
+
+		if (!cc->running)
+			goto done;
+
+		while (cc->tb_token < 1.0)
+			tb_sleep_until_next_token(cc);
+
+		now = microtime();
+		while (cc->head != cc->tail) {
+			pos = cc->tail % CRPC_QLEN;
+			c = cc->qreq[pos];
+			if (now - c->ts <= CSD_MAX_CLIENT_DELAY_US)
+				break;
+
+			cc->tail++;
+			cc->req_dropped_++;
+		}
+
+		crpc_send_request_vector(cc);
+	}
+
+done:
+	mutex_unlock(&cc->lock);
+	waitgroup_done(&cc->sender_waiter);
+}
+
+int csd_add_connection(struct crpc_session *s_, struct netaddr raddr)
+{
+	struct csd_session *s = (struct csd_session *)s_;
+	struct netaddr laddr;
+	struct csd_conn *cc;
+	tcpconn_t *c;
+	int ret, i;
+
+	if (s->cmn.nconns >= CRPC_MAX_REPLICA)
+		return -ENOMEM;
+
+	/* set up ephemeral IP and port */
+	laddr.ip = 0;
+	laddr.port = 0;
+
+	if (raddr.port != SRPC_PORT)
+		return -EINVAL;
+
+	/* dial */
+	ret = tcp_dial(laddr, raddr, &c);
+	if (ret)
+		return ret;
+
+	/* alloc conn */
+	cc = smalloc(sizeof(*cc));
+	if (!cc) {
+		tcp_close(c);
+		return -ENOMEM;
+	}
+	memset(cc, 0, sizeof(*cc));
+
+	for(i = 0; i < CRPC_QLEN; ++i) {
+		cc->qreq[i] = smalloc(sizeof(struct crpc_ctx));
+		if (!cc->qreq[i])
+			goto fail;
+	}
+
+	/* init conn */
+	cc->cmn.c = c;
+	cc->running = true;
+	cc->tb_token = 0.0;
+	cc->tb_refresh_rate = (rand() / (double)RAND_MAX) *
+		(CSD_TB_INIT_RATE - CSD_TB_MIN_RATE) + CSD_TB_MIN_RATE;
+	cc->tb_last_refresh = 0;
+	cc->res_idx = 0;
+	cc->session = s;
+
+	mutex_init(&cc->lock);
+	condvar_init(&cc->timer_cv);
+	condvar_init(&cc->sender_cv);
+	waitgroup_init(&cc->timer_waiter);
+	waitgroup_add(&cc->timer_waiter, 1);
+	waitgroup_init(&cc->sender_waiter);
+	waitgroup_add(&cc->sender_waiter, 1);
+
+	/* update session */
+	mutex_lock(&s->lock);
+	s->cmn.c[s->cmn.nconns++] = (struct crpc_conn *)cc;
+	mutex_unlock(&s->lock);
+
+	/* spawn timer thread */
+	ret = thread_spawn(crpc_timer, cc);
+	BUG_ON(ret);
+
+	/* spawn sender thread */
+	ret = thread_spawn(crpc_sender, cc);
+	BUG_ON(ret);
+
+	return 0;
+fail:
+	tcp_close(c);
+	for(i = i - 1; i >= 0; i--)
+		sfree(cc->qreq[i]);
+	sfree(cc);
+	return -ENOMEM;
 }
 
 ssize_t csd_send_one(struct crpc_session *s_,
 		      const void *buf, size_t len, int hash)
 {
 	struct csd_session *s = (struct csd_session *)s_;
+	struct csd_conn *cc;
+	int conn_idx;
 	ssize_t ret;
+	int i;
 
 	/* implementation is currently limited to a maximum payload size */
 	if (unlikely(len > SRPC_BUF_SIZE))
 		return -E2BIG;
 
+	for (i = 0; i < s->cmn.nconns; ++i) {
+		cc = (struct csd_conn *)s->cmn.c[i];
+		mutex_lock(&cc->lock);
+		tb_refill_token(cc);
+		mutex_unlock(&cc->lock);
+	}
+
 	mutex_lock(&s->lock);
 
-	tb_refill_token(s);
-	/* hot path, just send */
-	if (s->head == s->tail && s->tb_token >= 1.0) {
-		s->tb_token -= 1.0;
-		ret = crpc_send_raw(s, buf, len, s->req_id++);
-		mutex_unlock(&s->lock);
-		return ret;
+	for (i = 0; i < s->cmn.nconns; ++i) {
+		conn_idx = (s->next_conn_idx + i) % s->cmn.nconns;
+		cc = (struct csd_conn *)s->cmn.c[conn_idx];
+		/* hot path, just send */
+		mutex_lock(&cc->lock);
+		if (cc->head == cc->tail && cc->tb_token >= 1.0) {
+			cc->tb_token -= 1.0;
+			ret = crpc_send_raw(cc, buf, len, s->req_id++);
+			s->next_conn_idx = (conn_idx + 1) % s->cmn.nconns;
+			mutex_unlock(&cc->lock);
+			mutex_unlock(&s->lock);
+			return ret;
+		}
+		mutex_unlock(&cc->lock);
 	}
 
 	/* cold path, enqueue request and drain the queue */
@@ -206,48 +409,48 @@ static int cmpfunc(const void *a, const void *b) {
 	return (*(uint32_t*)a - *(uint32_t*)b);
 }
 
-static void crpc_update_tb_rate(struct csd_session *s, uint64_t us)
+static void crpc_update_tb_rate(struct csd_conn *cc, uint64_t us)
 {
-	double rate = s->tb_refresh_rate;
+	double rate = cc->tb_refresh_rate;
 	uint32_t samp;
 	double err;
 	uint64_t now = microtime();
 	int idx;
 	int len;
 
-	assert_mutex_held(&s->lock);
+	assert_mutex_held(&cc->lock);
 
-	s->res_ts[s->res_idx++ % SEDA_NREQ] = (uint32_t)us;
+	cc->res_ts[cc->res_idx++ % SEDA_NREQ] = (uint32_t)us;
 
-	if (now - s->seda_last_update > SEDA_TIMEOUT) {
-		len = s->res_idx % SEDA_NREQ;
-		qsort(s->res_ts, len, sizeof(uint32_t), cmpfunc);
+	if (now - cc->seda_last_update > SEDA_TIMEOUT) {
+		len = cc->res_idx % SEDA_NREQ;
+		qsort(cc->res_ts, len, sizeof(uint32_t), cmpfunc);
 		idx = (int)((len - 1) * 0.99);
-		samp = s->res_ts[idx];
-		s->cur = SEDA_ALPHA * s->cur + (1 - SEDA_ALPHA) * samp;
+		samp = cc->res_ts[idx];
+		cc->cur = SEDA_ALPHA * cc->cur + (1 - SEDA_ALPHA) * samp;
 
-		err = (s->cur - SEDA_TARGET) / (double)SEDA_TARGET;
+		err = (cc->cur - SEDA_TARGET) / (double)SEDA_TARGET;
 
 		if (err > SEDA_ERR_D)
 			rate = rate / SEDA_ADJ_D;
 		else if (err < SEDA_ERR_I)
 			rate += -(err - SEDA_CI) * SEDA_ADJ_I;
 
-		tb_set_rate(s, rate);
-		s->seda_last_update = microtime();
-		s->res_idx = 0;
+		tb_set_rate(cc, rate);
+		cc->seda_last_update = microtime();
+		cc->res_idx = 0;
 		return;
 	}
 
-	if (s->res_idx % SEDA_NREQ > 0)
+	if (cc->res_idx % SEDA_NREQ > 0)
 		return;
 
 	// sort res_ts;
-	qsort(s->res_ts, SEDA_NREQ, sizeof(uint32_t), cmpfunc);
-	samp = s->res_ts[(int)(SEDA_NREQ * 0.99)];
-	s->cur = SEDA_ALPHA * s->cur + (1 - SEDA_ALPHA) * samp;
+	qsort(cc->res_ts, SEDA_NREQ, sizeof(uint32_t), cmpfunc);
+	samp = cc->res_ts[(int)(SEDA_NREQ * 0.99)];
+	cc->cur = SEDA_ALPHA * cc->cur + (1 - SEDA_ALPHA) * samp;
 
-	err = (s->cur - SEDA_TARGET) / (double)SEDA_TARGET;
+	err = (cc->cur - SEDA_TARGET) / (double)SEDA_TARGET;
 
 	if (err > SEDA_ERR_D) {
 		rate = rate / SEDA_ADJ_D;
@@ -255,21 +458,21 @@ static void crpc_update_tb_rate(struct csd_session *s, uint64_t us)
 		rate += -(err - SEDA_CI) * SEDA_ADJ_I;
 	}
 
-	tb_set_rate(s, rate);
-	s->seda_last_update = now;
+	tb_set_rate(cc, rate);
+	cc->seda_last_update = now;
 }
 
-ssize_t csd_recv_one(struct crpc_session *s_, void *buf, size_t len,
+ssize_t csd_recv_one(struct crpc_conn *cc_, void *buf, size_t len,
 		     uint64_t *latency)
 {
-	struct csd_session *s = (struct csd_session *)s_;
+	struct csd_conn *cc = (struct csd_conn *)cc_;
 	struct ssd_hdr shdr;
 	ssize_t ret;
 	uint64_t now;
 	uint64_t us;
 
 	/* read the server header */
-	ret = tcp_read_full(s->cmn.c, &shdr, sizeof(shdr));
+	ret = tcp_read_full(cc->cmn.c, &shdr, sizeof(shdr));
 	if (unlikely(ret <= 0))
 		return ret;
 	assert(ret == sizeof(shdr));
@@ -290,18 +493,18 @@ ssize_t csd_recv_one(struct crpc_session *s_, void *buf, size_t len,
 	case SD_OP_CALL:
 		/* read the payload */
 		if (shdr.len > 0) {
-			ret = tcp_read_full(s->cmn.c, buf, shdr.len);
+			ret = tcp_read_full(cc->cmn.c, buf, shdr.len);
 			if (unlikely(ret <= 0))
 				return ret;
 			assert(ret == shdr.len);
-			s->resp_rx_++;
+			cc->resp_rx_++;
 		}
 
 		us = now - shdr.ts;
 
-		mutex_lock(&s->lock);
-		crpc_update_tb_rate(s, us);
-		mutex_unlock(&s->lock);
+		mutex_lock(&cc->lock);
+		crpc_update_tb_rate(cc, us);
+		mutex_unlock(&cc->lock);
 
 #if CSD_TRACK_FLOW
 		if (s->id == CSD_TRACK_FLOW_ID) {
@@ -311,9 +514,6 @@ ssize_t csd_recv_one(struct crpc_session *s_, void *buf, size_t len,
 #endif
 
 		break;
-	case SD_OP_WINUPDATE:
-		printf("Oops!\n");
-		break;
 	default:
 		log_warn("crpc: got invalid op %d", shdr.op);
 		return -EINVAL;
@@ -322,92 +522,12 @@ ssize_t csd_recv_one(struct crpc_session *s_, void *buf, size_t len,
 	return shdr.len;
 }
 
-static void crpc_timer(void *arg)
-{
-	struct csd_session *s = (struct csd_session *)arg;
-	uint64_t now;
-	int pos;
-	struct crpc_ctx *c;
-
-	mutex_lock(&s->lock);
-	while(true) {
-		while (s->running && s->head == s->tail)
-			condvar_wait(&s->timer_cv, &s->lock);
-
-		if (!s->running)
-			goto done;
-
-		now = microtime();
-
-		while (s->head != s->tail) {
-			pos = s->tail % CRPC_QLEN;
-			c = s->qreq[pos];
-			if (now - c->ts <= CSD_MAX_CLIENT_DELAY_US)
-				break;
-
-			s->tail++;
-			s->req_dropped_++;
-		}
-
-		if (s->head == s->tail) {
-			s->head = 0;
-			s->tail = 0;
-			continue;
-		}
-
-		// calculate next wake up time
-		pos = (s->head - 1) % CRPC_QLEN;
-		c = s->qreq[pos];
-		mutex_unlock(&s->lock);
-		timer_sleep_until(c->ts + CSD_MAX_CLIENT_DELAY_US);
-		mutex_lock(&s->lock);
-	}
-done:
-	mutex_unlock(&s->lock);
-	waitgroup_done(&s->timer_waiter);
-}
-
-static void crpc_sender(void *arg)
-{
-	struct csd_session *s = (struct csd_session *)arg;
-	int pos;
-	struct crpc_ctx *c;
-	uint64_t now;
-
-	mutex_lock(&s->lock);
-	while (true) {
-		while(s->running && s->head == s->tail)
-			condvar_wait(&s->sender_cv, &s->lock);
-
-		if (!s->running)
-			goto done;
-
-		while (s->tb_token < 1.0)
-			tb_sleep_until_next_token(s);
-
-		now = microtime();
-		while (s->head != s->tail) {
-			pos = s->tail % CRPC_QLEN;
-			c = s->qreq[pos];
-			if (now - c->ts <= CSD_MAX_CLIENT_DELAY_US)
-				break;
-
-			s->tail++;
-			s->req_dropped_++;
-		}
-
-		crpc_send_request_vector(s);
-	}
-
-done:
-	mutex_unlock(&s->lock);
-	waitgroup_done(&s->sender_waiter);
-}
 
 int csd_open(struct netaddr raddr, struct crpc_session **sout, int id)
 {
 	struct netaddr laddr;
 	struct csd_session *s;
+	struct csd_conn *cc;
 	tcpconn_t *c;
 	int i, ret;
 
@@ -418,10 +538,12 @@ int csd_open(struct netaddr raddr, struct crpc_session **sout, int id)
 	if (raddr.port != SRPC_PORT)
 		return -EINVAL;
 
+	/* dial */
 	ret = tcp_dial(laddr, raddr, &c);
 	if (ret)
 		return ret;
 
+	/* alloc session */
 	s = smalloc(sizeof(*s));
 	if (!s) {
 		tcp_close(c);
@@ -429,38 +551,55 @@ int csd_open(struct netaddr raddr, struct crpc_session **sout, int id)
 	}
 	memset(s, 0, sizeof(*s));
 
+	/* alloc conn */
+	cc = smalloc(sizeof(*cc));
+	if (!cc) {
+		tcp_close(c);
+		sfree(s);
+		return -ENOMEM;
+	}
+	memset(cc, 0, sizeof(*cc));
+
 	for (i = 0; i < CRPC_QLEN; ++i) {
-		s->qreq[i] = smalloc(sizeof(struct crpc_ctx));
-		if (!s->qreq[i])
+		cc->qreq[i] = smalloc(sizeof(struct crpc_ctx));
+		if (!cc->qreq[i])
 			goto fail;
 	}
 
-	s->cmn.c = c;
-	s->running = true;
-	s->tb_token = 0.0;
-	s->tb_refresh_rate = (rand() / (double)RAND_MAX) *
+	/* init conn */
+	cc->cmn.c = c;
+	cc->running = true;
+	cc->tb_token = 0.0;
+	cc->tb_refresh_rate = (rand() / (double)RAND_MAX) *
 		(CSD_TB_INIT_RATE - CSD_TB_MIN_RATE) + CSD_TB_MIN_RATE;
-	s->tb_last_refresh = 0;
-	s->res_idx = 0;
+	cc->tb_last_refresh = 0;
+	cc->res_idx = 0;
+	cc->session = s;
+
+	mutex_init(&cc->lock);
+	condvar_init(&cc->timer_cv);
+	condvar_init(&cc->sender_cv);
+	waitgroup_init(&cc->timer_waiter);
+	waitgroup_add(&cc->timer_waiter, 1);
+	waitgroup_init(&cc->sender_waiter);
+	waitgroup_add(&cc->sender_waiter, 1);
+
+	/* init session */
+	s->cmn.nconns = 1;
+	s->cmn.c[0] = (struct crpc_conn *)cc;
+	s->id = id;
+	s->req_id = 1;
 
 	mutex_init(&s->lock);
-	condvar_init(&s->timer_cv);
-	condvar_init(&s->sender_cv);
-	waitgroup_init(&s->timer_waiter);
-	waitgroup_add(&s->timer_waiter, 1);
-	waitgroup_init(&s->sender_waiter);
-	waitgroup_add(&s->sender_waiter, 1);
-	s->running = true;
 
-	if (id != -1)
-		s->id = id;
-	s->req_id = 1;
 	*sout = (struct crpc_session *)s;
 
-	ret = thread_spawn(crpc_timer, s);
+	/* spawn timer thread */
+	ret = thread_spawn(crpc_timer, cc);
 	BUG_ON(ret);
 
-	ret = thread_spawn(crpc_sender, s);
+	/* spawn sender thread */
+	ret = thread_spawn(crpc_sender, cc);
 	BUG_ON(ret);
 
 	return 0;
@@ -468,7 +607,8 @@ int csd_open(struct netaddr raddr, struct crpc_session **sout, int id)
 fail:
 	tcp_close(c);
 	for (i = i - 1; i >= 0; i--)
-		sfree(s->qreq[i]);
+		sfree(cc->qreq[i]);
+	sfree(cc);
 	sfree(s);
 	return -ENOMEM;
 }
@@ -476,20 +616,34 @@ fail:
 void csd_close(struct crpc_session *s_)
 {
 	struct csd_session *s = (struct csd_session *)s_;
-	int i;
+	struct csd_conn *cc;
+	int i, j;
 
-	mutex_lock(&s->lock);
-	s->running = false;
-	condvar_signal(&s->timer_cv);
-	condvar_signal(&s->sender_cv);
-	mutex_unlock(&s->lock);
+	/* terminate client */
+	for (i = 0; i < s->cmn.nconns; ++i) {
+		cc = (struct csd_conn *)s->cmn.c[i];
+		mutex_lock(&cc->lock);
+		cc->running = false;
+		condvar_signal(&cc->timer_cv);
+		condvar_signal(&cc->sender_cv);
+		mutex_unlock(&cc->lock);
+	}
 
-	waitgroup_wait(&s->timer_waiter);
-	waitgroup_wait(&s->sender_waiter);
+	/* wait for timer and sender thread */
+	for (i = 0; i < s->cmn.nconns; ++i) {
+		cc = (struct csd_conn *)s->cmn.c[i];
+		waitgroup_wait(&cc->timer_waiter);
+		waitgroup_wait(&cc->sender_waiter);
+	}
 
-	tcp_close(s->cmn.c);
-	for (i = 0; i < CRPC_QLEN; ++i)
-		sfree(s->qreq[i]);
+	/* free resources */
+	for (i = 0; i < s->cmn.nconns; ++i) {
+		cc = (struct csd_conn *)s->cmn.c[i];
+		tcp_close(cc->cmn.c);
+		for (j = 0; j < CRPC_QLEN; ++j)
+			sfree(cc->qreq[j]);
+		sfree(cc);
+	}
 	sfree(s);
 }
 
@@ -506,41 +660,75 @@ void csd_stat_clear(struct crpc_session *s_)
 
 uint64_t csd_stat_win_expired(struct crpc_session *s_)
 {
-	struct csd_session *s = (struct csd_session *)s_;
-	return s->win_expired_;
+	return 0;
 }
 
 uint64_t csd_stat_winu_rx(struct crpc_session *s_)
 {
-	struct csd_session *s = (struct csd_session *)s_;
-	return s->winu_rx_;
+	return 0;
 }
 
 uint64_t csd_stat_winu_tx(struct crpc_session *s_)
 {
-	struct csd_session *s = (struct csd_session *)s_;
-	return s->winu_tx_;
+	return 0;
 }
 
-uint64_t csd_stat_resp_rx(struct crpc_session *s_)
+uint64_t csd_conn_stat_resp_rx(struct crpc_conn *cc_)
 {
-	struct csd_session *s = (struct csd_session *)s_;
-	return s->resp_rx_;
+	struct csd_conn *cc = (struct csd_conn *)cc_;
+	return cc->resp_rx_;
 }
 
-uint64_t csd_stat_req_tx(struct crpc_session *s_)
+uint64_t csd_sess_stat_resp_rx(struct crpc_session *s_)
 {
 	struct csd_session *s = (struct csd_session *)s_;
-	return s->req_tx_;
+	uint64_t ret = 0;
+
+	for(int i = 0; i < s->cmn.nconns; ++i) {
+		ret += csd_conn_stat_resp_rx(s->cmn.c[i]);
+	}
+
+	return ret;
 }
 
-uint64_t csd_stat_req_dropped(struct crpc_session *s_)
+uint64_t csd_conn_stat_req_tx(struct crpc_conn *cc_)
+{
+	struct csd_conn *cc = (struct csd_conn *)cc_;
+	return cc->req_tx_;
+}
+
+uint64_t csd_sess_stat_req_tx(struct crpc_session *s_)
 {
 	struct csd_session *s = (struct csd_session *)s_;
-	return s->req_dropped_;
+	uint64_t ret = 0;
+
+	for(int i = 0; i < s->cmn.nconns; ++i) {
+		ret += csd_conn_stat_req_tx(s->cmn.c[i]);
+	}
+
+	return ret;
+}
+
+uint64_t csd_conn_stat_req_dropped(struct crpc_conn *cc_)
+{
+	struct csd_conn *cc = (struct csd_conn *)cc_;
+	return cc->req_dropped_;
+}
+
+uint64_t csd_sess_stat_req_dropped(struct crpc_session *s_)
+{
+	struct csd_session *s = (struct csd_session *)s_;
+	uint64_t ret = s->req_dropped_;
+
+	for(int i = 0; i < s->cmn.nconns; ++i) {
+		ret += csd_conn_stat_req_dropped(s->cmn.c[i]);
+	}
+
+	return ret;
 }
 
 struct crpc_ops csd_ops = {
+	.crpc_add_connection	= csd_add_connection,
 	.crpc_send_one		= csd_send_one,
 	.crpc_recv_one		= csd_recv_one,
 	.crpc_open		= csd_open,
@@ -550,7 +738,7 @@ struct crpc_ops csd_ops = {
 	.crpc_stat_winu_rx	= csd_stat_winu_rx,
 	.crpc_stat_win_expired	= csd_stat_win_expired,
 	.crpc_stat_winu_tx	= csd_stat_winu_tx,
-	.crpc_stat_resp_rx	= csd_stat_resp_rx,
-	.crpc_stat_req_tx	= csd_stat_req_tx,
-	.crpc_stat_req_dropped	= csd_stat_req_dropped,
+	.crpc_stat_resp_rx	= csd_sess_stat_resp_rx,
+	.crpc_stat_req_tx	= csd_sess_stat_req_tx,
+	.crpc_stat_req_dropped	= csd_sess_stat_req_dropped,
 };

@@ -20,37 +20,47 @@ struct ssd_ctx {
 /* for RPC client */
 #define SEDA_NREQ 100
 
-struct csd_session {
-	struct crpc_session	cmn;
-	uint64_t		id;
-	uint64_t		req_id;
-	mutex_t			lock;
+struct csd_session;
+struct csd_conn {
+	struct crpc_conn	cmn;
+
 	condvar_t		timer_cv;
 	waitgroup_t		timer_waiter;
 	bool			running;
 	condvar_t		sender_cv;
 	waitgroup_t		sender_waiter;
-
-	/* token bucket for rate limiting */
-	double			tb_token;
-	double			tb_refresh_rate;
-	uint64_t		tb_last_refresh;
-
-	int32_t			res_ts[SEDA_NREQ];
-	int			res_idx;
-	double			cur;
-	uint64_t		seda_last_update;
+	mutex_t			lock;
+	struct csd_session	*session;
 
 	/* a queue of pending RPC requests */
 	uint32_t		head;
 	uint32_t		tail;
 	struct crpc_ctx		*qreq[CRPC_QLEN];
 
-	/* client-side stats */
-	uint64_t		winu_rx_;
-	uint64_t		winu_tx_;
+	/* token bucket for rate limiting */
+	double			tb_token;
+	double			tb_refresh_rate;
+	uint64_t		tb_last_refresh;
+
+	/* for recording response time */
+	int32_t			res_ts[SEDA_NREQ];
+	int			res_idx;
+	double			cur;
+	uint64_t		seda_last_update;
+
+	/* per-connection stat */
 	uint64_t		resp_rx_;
 	uint64_t		req_tx_;
-	uint64_t		win_expired_;
+	uint64_t		req_dropped_;
+};
+
+struct csd_session {
+	struct crpc_session	cmn;
+	uint64_t		id;
+	uint64_t		req_id;
+	mutex_t			lock;
+	int			next_conn_idx;
+
+	/* client-side stats */
 	uint64_t		req_dropped_;
 };

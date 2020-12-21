@@ -22,9 +22,8 @@
 #define CDG_TRACK_FLOW			false
 #define CDG_TRACK_FLOW_ID		1
 
-static ssize_t crpc_send_request_vector(struct cdg_session *s)
+static ssize_t crpc_send_request_vector(struct cdg_conn *cc)
 {
-	assert_mutex_held(&s->lock);
 	struct cdg_hdr chdr[CRPC_QLEN];
 	struct iovec v[CRPC_QLEN * 2];
 	int nriov = 0;
@@ -32,8 +31,10 @@ static ssize_t crpc_send_request_vector(struct cdg_session *s)
 	ssize_t ret;
 	uint64_t now = microtime();
 
-	while (s->head != s->tail) {
-		struct cdg_ctx *c = s->qreq[s->tail++ % CRPC_QLEN];
+	assert_mutex_held(&cc->lock);
+
+	while (cc->head != cc->tail) {
+		struct cdg_ctx *c = cc->qreq[cc->tail++ % CRPC_QLEN];
 
 		chdr[nrhdr].magic = DG_REQ_MAGIC;
 		chdr[nrhdr].op = DG_OP_CALL;
@@ -55,12 +56,12 @@ static ssize_t crpc_send_request_vector(struct cdg_session *s)
 
 	if (nriov == 0)
 		return 0;
-	ret = tcp_writev_full(s->cmn.c, v, nriov);
+	ret = tcp_writev_full(cc->cmn.c, v, nriov);
 
-	s->req_tx_ += nrhdr;
+	cc->req_tx_ += nrhdr;
 
-	s->head = 0;
-	s->tail = 0;
+	cc->head = 0;
+	cc->tail = 0;
 
 	if (unlikely(ret < 0))
 		return ret;
@@ -74,27 +75,145 @@ static bool crpc_enqueue_one(struct cdg_session *s,
 	struct cdg_ctx *c;
 	uint64_t now = microtime();
 	int prio = hash % DG_MAX_PRIO;
+	int conn_idx;
+	struct cdg_conn *cc;
+	int i;
 
 	assert_mutex_held(&s->lock);
 
-	if (s->head - s->tail >= CRPC_QLEN || prio > s->local_prio) {
+	/* choose the connection */
+	for(i = 0; i < s->cmn.nconns; ++i) {
+		conn_idx = (s->next_conn_idx + i) % s->cmn.nconns;
+		cc = (struct cdg_conn *)s->cmn.c[conn_idx];
+		if (cc->head - cc->tail < CRPC_QLEN && prio <= cc->local_prio) {
+			s->next_conn_idx = (conn_idx + 1) % s->cmn.nconns;
+			break;
+		}
+		cc = NULL;
+	}
+
+	/* every connection is busy */
+	if (!cc) {
 		s->req_dropped_++;
-		//printf("[WARNING] Request dropped due to full queue\n");
 		return false;
 	}
 
-	pos = s->head++ % CRPC_QLEN;
-	c = s->qreq[pos];
+	mutex_lock(&cc->lock);
+
+	if (cc->head - cc->tail >= CRPC_QLEN || prio > cc->local_prio) {
+		s->req_dropped_++;
+		mutex_unlock(&cc->lock);
+		return false;
+	}
+
+	pos = cc->head++ % CRPC_QLEN;
+	c = cc->qreq[pos];
 	memcpy(c->cmn.buf, buf, len);
 	c->cmn.id = s->req_id++;
 	c->cmn.len = len;
 	c->cmn.ts = now;
 	c->prio = prio;
 
-	if (s->head - s->tail == 1)
-		condvar_signal(&s->sender_cv);
+	if (cc->head - cc->tail == 1)
+		condvar_signal(&cc->sender_cv);
+
+	mutex_unlock(&cc->lock);
 
 	return true;
+}
+
+static void crpc_sender(void *arg)
+{
+	struct cdg_conn *cc = (struct cdg_conn *)arg;
+
+	mutex_lock(&cc->lock);
+	while(true) {
+		while (cc->running && cc->head == cc->tail)
+			condvar_wait(&cc->sender_cv, &cc->lock);
+
+		if (!cc->running)
+			goto done;
+
+		// Wait for batching
+		if (cc->head - cc->tail < CRPC_QLEN) {
+			mutex_unlock(&cc->lock);
+			timer_sleep(CDG_BATCH_WAIT_US);
+			mutex_lock(&cc->lock);
+		}
+
+		// Batch sending
+		crpc_send_request_vector(cc);
+	}
+
+done:
+	mutex_unlock(&cc->lock);
+	waitgroup_done(&cc->sender_waiter);
+}
+
+int cdg_add_connection(struct crpc_session *s_, struct netaddr raddr)
+{
+	struct cdg_session *s = (struct cdg_session *)s_;
+	struct netaddr laddr;
+	struct cdg_conn *cc;
+	tcpconn_t *c;
+	int ret, i;
+
+	if (s->cmn.nconns >= CRPC_MAX_REPLICA)
+		return -ENOMEM;
+
+	/* set up ephemeral IP and port */
+	laddr.ip = 0;
+	laddr.port = 0;
+
+	if (raddr.port != SRPC_PORT)
+		return -EINVAL;
+
+	/* dial */
+	ret = tcp_dial(laddr, raddr, &c);
+	if (ret)
+		return ret;
+
+	/* alloc conn */
+	cc = smalloc(sizeof(*cc));
+	if (!cc) {
+		tcp_close(c);
+		return -ENOMEM;
+	}
+	memset(cc, 0, sizeof(*cc));
+
+	for(i = 0; i < CRPC_QLEN; ++i) {
+		cc->qreq[i] = smalloc(sizeof(struct cdg_ctx));
+		if (!cc->qreq[i])
+			goto fail;
+	}
+
+	/* init conn */
+	cc->cmn.c = c;
+	cc->local_prio = rand() % 128;
+	cc->running = true;
+	cc->session = s;
+
+	mutex_init(&cc->lock);
+	condvar_init(&cc->sender_cv);
+	waitgroup_init(&cc->sender_waiter);
+	waitgroup_add(&cc->sender_waiter, 1);
+
+	/* update session */
+	mutex_lock(&s->lock);
+	s->cmn.c[s->cmn.nconns++] = (struct crpc_conn *)cc;
+	mutex_unlock(&s->lock);
+
+	/* spawn sender thread */
+	ret = thread_spawn(crpc_sender, cc);
+	BUG_ON(ret);
+
+	return 0;
+fail:
+	tcp_close(c);
+	for (i = i - 1; i >= 0; i--)
+		sfree(cc->qreq[i]);
+	sfree(cc);
+	return -ENOMEM;
 }
 
 ssize_t cdg_send_one(struct crpc_session *s_,
@@ -115,16 +234,16 @@ ssize_t cdg_send_one(struct crpc_session *s_,
 	return len;
 }
 
-ssize_t cdg_recv_one(struct crpc_session *s_, void *buf, size_t len,
+ssize_t cdg_recv_one(struct crpc_conn *cc_, void *buf, size_t len,
 		     uint64_t *latency)
 {
-	struct cdg_session *s = (struct cdg_session *)s_;
+	struct cdg_conn *cc = (struct cdg_conn *)cc_;
 	struct sdg_hdr shdr;
 	ssize_t ret;
 	uint64_t now;
 
 	/* read the server header */
-	ret = tcp_read_full(s->cmn.c, &shdr, sizeof(shdr));
+	ret = tcp_read_full(cc->cmn.c, &shdr, sizeof(shdr));
 	if (unlikely(ret <= 0))
 		return ret;
 	assert(ret == sizeof(shdr));
@@ -145,21 +264,19 @@ ssize_t cdg_recv_one(struct crpc_session *s_, void *buf, size_t len,
 	case DG_OP_CALL:
 		/* read the payload */
 		if (shdr.len > 0) {
-			ret = tcp_read_full(s->cmn.c, buf, shdr.len);
+			ret = tcp_read_full(cc->cmn.c, buf, shdr.len);
 			if (unlikely(ret <= 0))
 				return ret;
 			assert(ret == shdr.len);
-			s->resp_rx_++;
+			cc->resp_rx_++;
 		}
 
-		mutex_lock(&s->lock);
-		s->local_prio = shdr.prio;
+		mutex_lock(&cc->lock);
+		cc->local_prio = shdr.prio;
+		mutex_unlock(&cc->lock);
 
 		if ((shdr.flags & DG_SFLAG_DROP) && latency)
 			*latency = now - shdr.ts_sent;
-
-		mutex_unlock(&s->lock);
-
 #if CDG_TRACK_FLOW
 		if (s->id == CDG_TRACK_FLOW_ID) {
 			printf("[%lu] ===> response: id=%lu, prio=%d\n",
@@ -167,9 +284,6 @@ ssize_t cdg_recv_one(struct crpc_session *s_, void *buf, size_t len,
 		}
 #endif
 
-		break;
-	case DG_OP_WINUPDATE:
-		printf("Oops!\n");
 		break;
 	default:
 		log_warn("crpc: got invalid op %d", shdr.op);
@@ -179,38 +293,11 @@ ssize_t cdg_recv_one(struct crpc_session *s_, void *buf, size_t len,
 	return shdr.len;
 }
 
-static void crpc_sender(void *arg)
-{
-	struct cdg_session *s = (struct cdg_session *)arg;
-
-	mutex_lock(&s->lock);
-	while(true) {
-		while (s->running && s->head == s->tail)
-			condvar_wait(&s->sender_cv, &s->lock);
-
-		if (!s->running)
-			goto done;
-
-		// Wait for batching
-		if (s->head - s->tail < CRPC_QLEN) {
-			mutex_unlock(&s->lock);
-			timer_sleep(CDG_BATCH_WAIT_US);
-			mutex_lock(&s->lock);
-		}
-
-		// Batch sending
-		crpc_send_request_vector(s);
-	}
-
-done:
-	mutex_unlock(&s->lock);
-	waitgroup_done(&s->sender_waiter);
-}
-
 int cdg_open(struct netaddr raddr, struct crpc_session **sout, int id)
 {
 	struct netaddr laddr;
 	struct cdg_session *s;
+	struct cdg_conn *cc;
 	tcpconn_t *c;
 	int i, ret;
 
@@ -223,10 +310,12 @@ int cdg_open(struct netaddr raddr, struct crpc_session **sout, int id)
 	if (raddr.port != SRPC_PORT)
 		return -EINVAL;
 
+	/* dial */
 	ret = tcp_dial(laddr, raddr, &c);
 	if (ret)
 		return ret;
 
+	/* alloc session */
 	s = smalloc(sizeof(*s));
 	if (!s) {
 		tcp_close(c);
@@ -234,25 +323,43 @@ int cdg_open(struct netaddr raddr, struct crpc_session **sout, int id)
 	}
 	memset(s, 0, sizeof(*s));
 
+	/* alloc conn */
+	cc = smalloc(sizeof(*cc));
+	if (!cc){
+		tcp_close(c);
+		sfree(s);
+		return -ENOMEM;
+	}
+	memset(cc, 0, sizeof(*cc));
+
 	for (i = 0; i < CRPC_QLEN; ++i) {
-		s->qreq[i] = smalloc(sizeof(struct cdg_ctx));
-		if (!s->qreq[i])
+		cc->qreq[i] = smalloc(sizeof(struct cdg_ctx));
+		if (!cc->qreq[i])
 			goto fail;
 	}
 
-	s->cmn.c = c;
-	s->running = true;
-	s->local_prio = rand() % 128;
-	mutex_init(&s->lock);
-	condvar_init(&s->sender_cv);
-	waitgroup_init(&s->sender_waiter);
-	waitgroup_add(&s->sender_waiter, 1);
-	if (id != -1)
-		s->id = id;
+	/* init conn */
+	cc->cmn.c = c;
+	cc->local_prio = rand() % 128;
+	cc->running = true;
+	cc->session = s;
+
+	mutex_init(&cc->lock);
+	condvar_init(&cc->sender_cv);
+	waitgroup_init(&cc->sender_waiter);
+	waitgroup_add(&cc->sender_waiter, 1);
+
+	/* init session */
+	s->cmn.nconns = 1;
+	s->cmn.c[0] = (struct crpc_conn *)cc;
+	s->id = id;
 	s->req_id = 1;
+	mutex_init(&s->lock);
+
 	*sout = (struct crpc_session *)s;
 
-	ret = thread_spawn(crpc_sender, s);
+	/* spawn sender thread */
+	ret = thread_spawn(crpc_sender, cc);
 	BUG_ON(ret);
 
 	return 0;
@@ -260,7 +367,8 @@ int cdg_open(struct netaddr raddr, struct crpc_session **sout, int id)
 fail:
 	tcp_close(c);
 	for (i = i - 1; i >= 0; i--)
-		sfree(s->qreq[i]);
+		sfree(cc->qreq[i]);
+	sfree(cc);
 	sfree(s);
 	return -ENOMEM;
 }
@@ -268,18 +376,30 @@ fail:
 void cdg_close(struct crpc_session *s_)
 {
 	struct cdg_session *s = (struct cdg_session *)s_;
-	int i;
+	struct cdg_conn *cc;
+	int i, j;
 
-	mutex_lock(&s->lock);
-	s->running = false;
-	condvar_signal(&s->sender_cv);
-	mutex_unlock(&s->lock);
+	/* terminate client and wait for sender thread */
+	for (i = 0; i < s->cmn.nconns; ++i) {
+		cc = (struct cdg_conn *)s->cmn.c[i];
+		mutex_lock(&cc->lock);
+		cc->running = false;
+		condvar_signal(&cc->sender_cv);
+		mutex_unlock(&cc->lock);
+	}
+	for (i = 0; i < s->cmn.nconns; ++i) {
+		cc = (struct cdg_conn *)s->cmn.c[i];
+		waitgroup_wait(&cc->sender_waiter);
+	}
 
-	waitgroup_wait(&s->sender_waiter);
-
-	tcp_close(s->cmn.c);
-	for (i = 0; i < CRPC_QLEN; ++i)
-		sfree(s->qreq[i]);
+	/* free resources */
+	for (i = 0; i < s->cmn.nconns; ++i) {
+		cc = (struct cdg_conn *)s->cmn.c[i];
+		tcp_close(cc->cmn.c);
+		for (j = 0; j < CRPC_QLEN; ++j)
+			sfree(cc->qreq[j]);
+		sfree(cc);
+	}
 	sfree(s);
 }
 
@@ -309,16 +429,40 @@ uint64_t cdg_stat_winu_tx(struct crpc_session *s_)
 	return 0;
 }
 
-uint64_t cdg_stat_resp_rx(struct crpc_session *s_)
+uint64_t cdg_conn_stat_resp_rx(struct crpc_conn *cc_)
 {
-	struct cdg_session *s = (struct cdg_session *)s_;
-	return s->resp_rx_;
+	struct cdg_conn *cc = (struct cdg_conn *)cc_;
+	return cc->resp_rx_;
 }
 
-uint64_t cdg_stat_req_tx(struct crpc_session *s_)
+uint64_t cdg_sess_stat_resp_rx(struct crpc_session *s_)
 {
 	struct cdg_session *s = (struct cdg_session *)s_;
-	return s->req_tx_;
+	uint64_t ret = 0;
+
+	for(int i = 0; i < s->cmn.nconns; ++i) {
+		ret += cdg_conn_stat_resp_rx(s->cmn.c[i]);
+	}
+
+	return ret;
+}
+
+uint64_t cdg_conn_stat_req_tx(struct crpc_conn *cc_)
+{
+	struct cdg_conn *cc = (struct cdg_conn *)cc_;
+	return cc->req_tx_;
+}
+
+uint64_t cdg_sess_stat_req_tx(struct crpc_session *s_)
+{
+	struct cdg_session *s = (struct cdg_session *)s_;
+	uint64_t ret = 0;
+
+	for(int i = 0; i < s->cmn.nconns; ++i) {
+		ret += cdg_conn_stat_req_tx(s->cmn.c[i]);
+	}
+
+	return ret;
 }
 
 uint64_t cdg_stat_req_dropped(struct crpc_session *s_)
@@ -328,6 +472,7 @@ uint64_t cdg_stat_req_dropped(struct crpc_session *s_)
 }
 
 struct crpc_ops cdg_ops = {
+	.crpc_add_connection	= cdg_add_connection,
 	.crpc_send_one		= cdg_send_one,
 	.crpc_recv_one		= cdg_recv_one,
 	.crpc_open		= cdg_open,
@@ -337,7 +482,7 @@ struct crpc_ops cdg_ops = {
 	.crpc_stat_winu_rx	= cdg_stat_winu_rx,
 	.crpc_stat_win_expired	= cdg_stat_win_expired,
 	.crpc_stat_winu_tx	= cdg_stat_winu_tx,
-	.crpc_stat_resp_rx	= cdg_stat_resp_rx,
-	.crpc_stat_req_tx	= cdg_stat_req_tx,
+	.crpc_stat_resp_rx	= cdg_sess_stat_resp_rx,
+	.crpc_stat_req_tx	= cdg_sess_stat_req_tx,
 	.crpc_stat_req_dropped	= cdg_stat_req_dropped,
 };
