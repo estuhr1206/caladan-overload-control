@@ -17,7 +17,6 @@
 #include "bw_proto.h"
 #include "bw_config.h"
 
-
 #define CBW_TRACK_FLOW			false
 #define CBW_TRACK_FLOW_ID		1
 
@@ -199,7 +198,8 @@ static void crpc_drain_queue(struct cbw_session *s)
 	while (s->head != s->tail) {
 		pos = s->tail % CRPC_QLEN;
 		c = s->qreq[pos];
-		if (now - c->ts <= CBW_MAX_CLIENT_DELAY_US)
+		if (CBW_MAX_CLIENT_DELAY_US == 0 ||
+		    now - c->ts <= CBW_MAX_CLIENT_DELAY_US)
 			break;
 
 		s->tail++;
@@ -580,8 +580,12 @@ int cbw_open(struct netaddr raddr, struct crpc_session **sout, int id)
 	*sout = (struct crpc_session *)s;
 
 	/* spawn timer thread */
-	ret = thread_spawn(crpc_timer, s);
-	BUG_ON(ret);
+	if (CBW_MAX_CLIENT_DELAY_US > 0) {
+		ret = thread_spawn(crpc_timer, s);
+		BUG_ON(ret);
+	} else {
+		waitgroup_done(&s->timer_waiter);
+	}
 
 	return 0;
 

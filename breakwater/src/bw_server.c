@@ -28,10 +28,6 @@
 #define TS_BUF_SIZE		(1 << TS_BUF_SIZE_EXP)
 #define TS_BUF_MASK		(TS_BUF_SIZE - 1)
 
-/* the maximum supported window size */
-#define SBW_MAX_WINDOW_EXP	6
-#define SBW_MAX_WINDOW		64
-
 #define SBW_TRACK_FLOW		false
 #define SBW_TRACK_FLOW_ID	1
 
@@ -75,6 +71,9 @@ atomic_t srpc_win_avail;
 
 /* global window used */
 atomic_t srpc_win_used;
+
+/* downstream window for multi-hierarchy */
+atomic_t srpc_win_ds;
 
 /* the number of pending requests */
 atomic_t srpc_num_pending;
@@ -174,14 +173,23 @@ static void record(int win_avail, uint64_t delay)
 
 static int srpc_get_slot(struct sbw_session *s)
 {
-	int slot = __builtin_ffsl(s->avail_slots[0]) - 1;
+	int base;
+	int slot = -1;
+	for (base = 0; base < BITMAP_LONG_SIZE(SBW_MAX_WINDOW); ++base) {
+		slot = __builtin_ffsl(s->avail_slots[base]) - 1;
+		if (slot >= 0)
+			break;
+	}
+
 	if (slot >= 0) {
+		slot += BITS_PER_LONG * base;
 		bitmap_atomic_clear(s->avail_slots, slot);
 		s->slots[slot] = smalloc(sizeof(struct sbw_ctx));
 		s->slots[slot]->cmn.s = (struct srpc_session *)s;
 		s->slots[slot]->cmn.idx = slot;
 		s->slots[slot]->cmn.ds_win = 0;
 	}
+
 	return slot;
 }
 
@@ -251,8 +259,6 @@ static int srpc_send_completion_vector(struct sbw_session *s,
 		shdr[nrhdr].len = len;
 		shdr[nrhdr].id = c->cmn.id;
 		shdr[nrhdr].win = (uint64_t)s->win;
-		if (c->cmn.ds_win > 0)
-			shdr[nrhdr].win = MIN(shdr[nrhdr].win, c->cmn.ds_win);
 		shdr[nrhdr].ts_sent = c->ts_sent;
 		shdr[nrhdr].flags = flags;
 
@@ -292,12 +298,16 @@ static int srpc_send_completion_vector(struct sbw_session *s,
 static void srpc_update_window(struct sbw_session *s, bool req_dropped)
 {
 	int win_avail = atomic_read(&srpc_win_avail);
+	int win_ds = atomic_read(&srpc_win_ds);
 	int win_used = atomic_read(&srpc_win_used);
 	int num_sess = atomic_read(&srpc_num_sess);
 	int old_win = s->win;
 	int win_diff;
 	int open_window;
 	int max_overprovision;
+
+	if (win_ds > 0)
+		win_avail = MIN(win_avail, win_ds);
 
 	assert_spin_lock_held(&s->lock);
 
@@ -410,6 +420,8 @@ static void srpc_worker(void *arg)
 	c->drop = false;
 	srpc_handler((struct srpc_ctx *)c);
 
+	atomic_write(&srpc_win_ds, c->cmn.ds_win);
+
 	spin_lock_np(&s->lock);
 	bitmap_set(s->completed_slots, c->cmn.idx);
 	th = s->sender_th;
@@ -491,7 +503,8 @@ again:
 
 		atomic_inc(&srpc_num_pending);
 
-		if (runtime_queue_us() >= SBW_DROP_THRESH) {
+		if (SBW_DROP_THRESH > 0 &&
+		    runtime_queue_us() >= SBW_DROP_THRESH) {
 			thread_t *th;
 
 			c->drop = true;
@@ -771,6 +784,7 @@ static void srpc_server(void *arg)
 		assert(atomic_read(&srpc_num_drained) == 0);
 		atomic_write(&srpc_win_used, 0);
 		atomic_write(&srpc_win_avail, runtime_max_cores());
+		atomic_write(&srpc_win_ds, 0);
 		fflush(stdout);
 	}
 }
@@ -871,6 +885,7 @@ static void srpc_listener(void *arg)
 
 	atomic_write(&srpc_win_avail, runtime_max_cores());
 	atomic_write(&srpc_win_used, 0);
+	atomic_write(&srpc_win_ds, 0);
 	atomic_write(&srpc_num_pending, 0);
 
 	/* init stats */

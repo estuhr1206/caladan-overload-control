@@ -77,6 +77,7 @@ constexpr uint64_t kWarmUpTime = 2000000;
 constexpr uint64_t kExperimentTime = 4000000;
 // RTT
 constexpr uint64_t kRTT = 10;
+constexpr uint64_t kNumDupClient = 32;
 
 std::vector<double> offered_loads;
 double offered_load;
@@ -84,7 +85,8 @@ double offered_load;
 static SyntheticWorker *workers[NCPU];
 
 struct lb_ctx;
-rpc::RpcClient *lb_client;
+rpc::RpcClient *lb_client[kNumDupClient];
+int next_lb_idx;
 
 /* server-side stat */
 constexpr uint64_t kRPCSStatPort = 8002;
@@ -505,6 +507,7 @@ struct lb_ctx {
 };
 
 void LoadBalancer(struct srpc_ctx *ctx) {
+  uint32_t ds_win = 0;
   // Validate and parse the request
   if (unlikely(ctx->req_len != sizeof(payload))) {
     log_err("got invalid RPC len %ld", ctx->req_len);
@@ -520,15 +523,29 @@ void LoadBalancer(struct srpc_ctx *ctx) {
   ds_ctx.req.index = hton64(reinterpret_cast<uint64_t>(&ds_ctx));
   ds_ctx.waiter = &resp_waiter;
 
+  for(int i = 0; i < kNumDupClient; ++i) {
+    int idx = (next_lb_idx + i) % kNumDupClient;
+    if (lb_client[idx]->WinAvail() > 0) {
+      next_lb_idx = idx;
+      break;
+    }
+  }
+
+  rpc::RpcClient *c = lb_client[next_lb_idx];
+  next_lb_idx = (next_lb_idx + 1) % kNumDupClient;
+
   // Call to downstream
-  lb_client->Send(&ds_ctx.req, sizeof(ds_ctx.req), 0);
+  c->Send(&ds_ctx.req, sizeof(ds_ctx.req), 0);
 
   // Wait for the response
   resp_waiter.Wait();
 
+  for(int i = 0; i < kNumDupClient; ++i)
+    ds_win += lb_client[i]->WinAvail();
+
   // Craft a response
   ctx->resp_len = sizeof(payload);
-  ctx->ds_win = lb_client->WinAvail();
+  ctx->ds_win = ds_win;
   payload *out = reinterpret_cast<payload *>(ctx->resp_buf);
   memcpy(out, in, sizeof(*out));
   out->success = ds_ctx.resp.success;
@@ -541,33 +558,36 @@ void LBHandler(void *arg) {
   rt::Thread([] { RPCSStatServer(); }).Detach();
   int server_idx;
   int conn_idx;
-  /* Dial to the first connection */
-  lb_client = rpc::RpcClient::Dial(raddr[0], 1);
 
-  /* Add connections to the replica */
-  if (nconn[0] > 1) {
-    server_idx = 0;
-    conn_idx = 1;
-  } else {
-    server_idx = 1;
-    conn_idx = 0;
-  }
+  next_lb_idx = 0;
+  for (int i = 0; i < kNumDupClient; ++i) {
+    /* Dial to the first connection */
+    lb_client[i] = rpc::RpcClient::Dial(raddr[0], 1);
 
-  while (server_idx < num_servers) {
-    lb_client->AddConnection(raddr[server_idx]);
-    if (++conn_idx >= nconn[server_idx]) {
-      server_idx++;
+    /* Add connections to the replica */
+    if (nconn[0] > 1) {
+      server_idx = 0;
+      conn_idx = 1;
+    } else {
+      server_idx = 1;
       conn_idx = 0;
     }
-  }
 
-  // Start the receiver thread for downstream
-  for(int i = 0; i < lb_client->NumConns(); ++i) {
-    rt::Thread([&, i] {
-      payload rp;
+    while (server_idx < num_servers) {
+      lb_client[i]->AddConnection(raddr[server_idx]);
+      if (++conn_idx >= nconn[server_idx]) {
+        server_idx++;
+        conn_idx = 0;
+      }
+    }
 
-      while (true) {
-        ssize_t ret = lb_client->Recv(&rp, sizeof(rp), i, nullptr);
+    // Start the receiver thread for downstream
+    for(int j = 0; j < lb_client[i]->NumConns(); ++j) {
+      rt::Thread([&, i, j] {
+        payload rp;
+
+        while (true) {
+          ssize_t ret = lb_client[i]->Recv(&rp, sizeof(rp), j, nullptr);
 	if (ret != static_cast<ssize_t>(sizeof(rp))) {
 	  if (ret == 0 || ret < 0) break;
 	  panic("read failed, ret = %ld", ret);
@@ -581,8 +601,9 @@ void LBHandler(void *arg) {
 
 	/* wake up request */
 	ctx->waiter->Done();
-      }
-    }).Detach();
+        }
+      }).Detach();
+    }
   }
 
   /* Start Server */
@@ -1219,7 +1240,6 @@ void SteadyStateExperiment(int threads, double offered_rps,
              static_cast<double>(csr.req_tx) / elapsed * 1000000,
              static_cast<double>(csr.win_expired) / elapsed * 1000000,
              static_cast<double>(csr.req_dropped) / elapsed * 1000000};
-
   // Print the results.
   PrintStatResults(w, &cs, &ss);
 }
