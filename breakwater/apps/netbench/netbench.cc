@@ -523,16 +523,15 @@ void LoadBalancer(struct srpc_ctx *ctx) {
   ds_ctx.req.index = hton64(reinterpret_cast<uint64_t>(&ds_ctx));
   ds_ctx.waiter = &resp_waiter;
 
+  int idx = next_lb_idx;
+
   for(int i = 0; i < kNumDupClient; ++i) {
-    int idx = (next_lb_idx + i) % kNumDupClient;
-    if (lb_client[idx]->WinAvail() > 0) {
-      next_lb_idx = idx;
-      break;
-    }
+    if (lb_client[idx]->WinAvail() > 0) break;
+    idx = (idx + 1) % kNumDupClient;
   }
 
-  rpc::RpcClient *c = lb_client[next_lb_idx];
-  next_lb_idx = (next_lb_idx + 1) % kNumDupClient;
+  rpc::RpcClient *c = lb_client[idx];
+  next_lb_idx = (idx + 1) % kNumDupClient;
 
   // Call to downstream
   c->Send(&ds_ctx.req, sizeof(ds_ctx.req), 0);
@@ -546,12 +545,21 @@ void LoadBalancer(struct srpc_ctx *ctx) {
   // Craft a response
   ctx->resp_len = sizeof(payload);
   ctx->ds_win = ds_win;
+  ctx->drop = !ds_ctx.resp.success;
   payload *out = reinterpret_cast<payload *>(ctx->resp_buf);
   memcpy(out, in, sizeof(*out));
   out->success = ds_ctx.resp.success;
   out->tsc_end = hton64(rdtscp(&out->cpu));
   out->cpu = hton32(out->cpu);
   out->server_queue = hton64(rt::RuntimeQueueUS());
+}
+
+void LBDropHandler(struct crpc_ctx *c) {
+  const payload *rp = reinterpret_cast<const payload *>(c->buf);
+  lb_ctx *ctx = reinterpret_cast<lb_ctx *>(ntoh64(rp->index));
+
+  ctx->resp.success = false;
+  ctx->waiter->Done();
 }
 
 void LBHandler(void *arg) {
@@ -562,7 +570,7 @@ void LBHandler(void *arg) {
   next_lb_idx = 0;
   for (int i = 0; i < kNumDupClient; ++i) {
     /* Dial to the first connection */
-    lb_client[i] = rpc::RpcClient::Dial(raddr[0], 1);
+    lb_client[i] = rpc::RpcClient::Dial(raddr[0], 1, LBDropHandler);
 
     /* Add connections to the replica */
     if (nconn[0] > 1) {
@@ -751,7 +759,7 @@ std::vector<work_unit> RunExperiment(
   int conn_idx;
 
   for (int i = 0; i < threads; ++i) {
-    std::unique_ptr<rpc::RpcClient> outc(rpc::RpcClient::Dial(raddr[0], i + 1));
+    std::unique_ptr<rpc::RpcClient> outc(rpc::RpcClient::Dial(raddr[0], i + 1, nullptr));
     if (unlikely(outc == nullptr)) panic("couldn't connect to raddr.");
 
     if (nconn[0] > 1) {
@@ -804,6 +812,16 @@ std::vector<work_unit> RunExperiment(
   auto start = steady_clock::now();
   barrier();
 
+  // Clear the stat after warmup time
+  rt::Sleep(kWarmUpTime);
+  if (!b || b->IsLeader()) {
+    s1 = ReadRPCSStat();
+    sh1 = ReadShenangoStat();
+  }
+  for (auto &c : clients) {
+    c->StatClear();
+  }
+
   // Wait for the workers to finish.
   for (auto &t : th) t.Join();
 
@@ -841,12 +859,14 @@ std::vector<work_unit> RunExperiment(
   double min_throughput = 0.0;
   double max_throughput = 0.0;
   uint64_t good_resps = 0;
+  uint64_t resps = 0;
   uint64_t offered = 0;
 
   for (int i = 0; i < threads; ++i) {
     auto &v = *samples[i];
     double throughput;
     int slo_success;
+    int resp_success;
 
     offered += v.size();
     // Remove requests that did not complete.
@@ -856,11 +876,15 @@ std::vector<work_unit> RunExperiment(
                                      (s.start_us + s.duration_us) < kWarmUpTime);
                            }),
             v.end());
-    slo_success = std::count_if(v.begin(), v.end(), [](const work_unit &s) {
-      return s.duration_us < slo;
+    resp_success = std::count_if(v.begin(), v.end(), [](const work_unit &s) {
+      return s.success;
     });
-    throughput = static_cast<double>(v.size()) / elapsed_ * 1000000;
+    slo_success = std::count_if(v.begin(), v.end(), [](const work_unit &s) {
+      return s.success && s.duration_us < slo;
+    });
+    throughput = static_cast<double>(resp_success) / elapsed_ * 1000000;
 
+    resps += resp_success;
     good_resps += slo_success;
     if (i == 0) {
       min_throughput = throughput;
@@ -878,7 +902,7 @@ std::vector<work_unit> RunExperiment(
     csr->offered_rps = static_cast<double>(offered) / elapsed_ * 1000000;
     csr->offered_rps *=
         static_cast<double>(kExperimentTime - kWarmUpTime) / kExperimentTime;
-    csr->rps = static_cast<double>(w.size()) / elapsed_ * 1000000;
+    csr->rps = static_cast<double>(resps) / elapsed_ * 1000000;
     csr->goodput = static_cast<double>(good_resps) / elapsed_ * 1000000;
     csr->min_percli_tput = min_throughput;
     csr->max_percli_tput = max_throughput;

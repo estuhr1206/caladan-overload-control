@@ -293,7 +293,8 @@ ssize_t cdg_recv_one(struct crpc_conn *cc_, void *buf, size_t len,
 	return shdr.len;
 }
 
-int cdg_open(struct netaddr raddr, struct crpc_session **sout, int id)
+int cdg_open(struct netaddr raddr, struct crpc_session **sout, int id,
+	     srpc_fn_t drop_handler)
 {
 	struct netaddr laddr;
 	struct cdg_session *s;

@@ -15,7 +15,6 @@
 struct sbw_ctx {
 	struct srpc_ctx		cmn;
 	uint64_t		ts_sent;
-	bool			drop;
 };
 
 struct cbw_session;

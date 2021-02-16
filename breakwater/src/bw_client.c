@@ -202,6 +202,8 @@ static void crpc_drain_queue(struct cbw_session *s)
 		    now - c->ts <= CBW_MAX_CLIENT_DELAY_US)
 			break;
 
+		if (s->cmn.drop_handler)
+			s->cmn.drop_handler(c);
 		s->tail++;
 		s->req_dropped_++;
 #if CBW_TRACK_FLOW
@@ -397,7 +399,8 @@ again:
 			if (unlikely(ret <= 0))
 				return ret;
 			assert(ret == shdr.len);
-			cc->resp_rx_++;
+			if (!(shdr.flags & BW_SFLAG_DROP))
+				cc->resp_rx_++;
 		}
 
 		/* update the window */
@@ -485,6 +488,11 @@ static void crpc_timer(void *arg)
 			if (now - c->ts <= CBW_MAX_CLIENT_DELAY_US)
 				break;
 
+			// handle drop
+			if (s->cmn.drop_handler)
+				s->cmn.drop_handler(c);
+
+			// update stats
 			s->tail++;
 			s->req_dropped_++;
 			num_drops++;
@@ -519,7 +527,8 @@ done:
 	waitgroup_done(&s->timer_waiter);
 }
 
-int cbw_open(struct netaddr raddr, struct crpc_session **sout, int id)
+int cbw_open(struct netaddr raddr, struct crpc_session **sout, int id,
+	     crpc_fn_t drop_handler)
 {
 	struct netaddr laddr;
 	struct cbw_session *s;
@@ -567,6 +576,7 @@ int cbw_open(struct netaddr raddr, struct crpc_session **sout, int id)
 	/* init session */
 	s->cmn.nconns = 1;
 	s->cmn.c[0] = (struct crpc_conn *)cc;
+	s->cmn.drop_handler = drop_handler;
 	s->running = true;
 	s->demand_sync = false;
 	s->id = id;
@@ -641,6 +651,13 @@ uint32_t cbw_sess_win_avail(struct crpc_session *s_)
 
 void cbw_conn_stat_clear(struct crpc_conn *cc_)
 {
+	struct cbw_conn *cc = (struct cbw_conn *)cc_;
+
+	cc->win_expired_ = 0;
+	cc->winu_rx_ = 0;
+	cc->winu_tx_ = 0;
+	cc->resp_rx_ = 0;
+	cc->req_tx_ = 0;
 	return;
 }
 
@@ -648,6 +665,7 @@ void cbw_sess_stat_clear(struct crpc_session *s_)
 {
 	struct cbw_session *s = (struct cbw_session *)s_;
 
+	s->req_dropped_ = 0;
 	for(int i = 0; i < s->cmn.nconns; ++i) {
 		cbw_conn_stat_clear(s->cmn.c[i]);
 	}

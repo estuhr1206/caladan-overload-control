@@ -30,6 +30,7 @@ struct srpc_ctx {
 	size_t			resp_len;
 	char			req_buf[SRPC_BUF_SIZE];
 	char			resp_buf[SRPC_BUF_SIZE];
+	bool			drop;
 	uint64_t		ds_win;
 };
 
@@ -59,6 +60,15 @@ struct srpc_ops {
 #define CRPC_QLEN		16
 #define CRPC_MAX_REPLICA	256
 
+struct crpc_ctx {
+	size_t			len;
+	uint64_t		id;
+	uint64_t		ts;
+	char			buf[SRPC_BUF_SIZE];
+};
+
+typedef void (*crpc_fn_t)(struct crpc_ctx *ctx);
+
 struct crpc_conn {
 	tcpconn_t		*c;
 };
@@ -66,13 +76,7 @@ struct crpc_conn {
 struct crpc_session {
 	struct crpc_conn	*c[CRPC_MAX_REPLICA];
 	int			nconns;
-};
-
-struct crpc_ctx {
-	size_t			len;
-	uint64_t		id;
-	uint64_t		ts;
-	char			buf[SRPC_BUF_SIZE];
+	crpc_fn_t		drop_handler;
 };
 
 struct crpc_ops {
@@ -123,7 +127,7 @@ struct crpc_ops {
 	 * Returns 0 if successful.
 	 */
 	int (*crpc_open)(struct netaddr raddr, struct crpc_session **sout,
-			 int id);
+			 int id, crpc_fn_t drop_handler);
 
 	/**
 	 * crpc_close - closes an RPC session

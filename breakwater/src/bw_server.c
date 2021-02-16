@@ -188,6 +188,7 @@ static int srpc_get_slot(struct sbw_session *s)
 		s->slots[slot]->cmn.s = (struct srpc_session *)s;
 		s->slots[slot]->cmn.idx = slot;
 		s->slots[slot]->cmn.ds_win = 0;
+		s->slots[slot]->cmn.drop = false;
 	}
 
 	return slot;
@@ -245,7 +246,7 @@ static int srpc_send_completion_vector(struct sbw_session *s,
 		char *buf;
 		uint8_t flags = 0;
 
-		if (!c->drop) {
+		if (!c->cmn.drop) {
 			len = c->cmn.resp_len;
 			buf = c->cmn.resp_buf;
 		} else {
@@ -417,7 +418,7 @@ static void srpc_worker(void *arg)
 	struct sbw_session *s = (struct sbw_session *)c->cmn.s;
 	thread_t *th;
 
-	c->drop = false;
+	c->cmn.drop = false;
 	srpc_handler((struct srpc_ctx *)c);
 
 	atomic_write(&srpc_win_ds, c->cmn.ds_win);
@@ -507,7 +508,7 @@ again:
 		    runtime_queue_us() >= SBW_DROP_THRESH) {
 			thread_t *th;
 
-			c->drop = true;
+			c->cmn.drop = true;
 			bitmap_set(s->completed_slots, idx);
 			th = s->sender_th;
 			s->sender_th = NULL;
@@ -621,7 +622,7 @@ static void srpc_sender(void *arg)
 
 		bitmap_for_each_set(tmp, SBW_MAX_WINDOW, i) {
 			struct sbw_ctx *c = s->slots[i];
-			if (c->drop) {
+			if (c->cmn.drop) {
 				req_dropped = true;
 				break;
 			}

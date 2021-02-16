@@ -523,7 +523,8 @@ ssize_t csd_recv_one(struct crpc_conn *cc_, void *buf, size_t len,
 }
 
 
-int csd_open(struct netaddr raddr, struct crpc_session **sout, int id)
+int csd_open(struct netaddr raddr, struct crpc_session **sout, int id,
+	     srpc_fn_t drop_handler)
 {
 	struct netaddr laddr;
 	struct csd_session *s;

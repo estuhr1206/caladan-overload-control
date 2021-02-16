@@ -21,7 +21,8 @@ class RpcClient {
   RpcClient& operator=(const RpcClient&) = delete;
 
   // Creates an RPC session.
-  static RpcClient *Dial(netaddr raddr, int id);
+  static RpcClient *Dial(netaddr raddr, int id,
+			 crpc_fn_t drop_handler);
 
   int AddConnection(netaddr raddr);
 

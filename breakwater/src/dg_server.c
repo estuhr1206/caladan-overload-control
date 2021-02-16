@@ -183,7 +183,7 @@ static int srpc_send_completion_vector(struct sdg_session *s,
 		char *buf;
 		uint8_t flags = 0;
 
-		if (!c->drop) {
+		if (!c->cmn.drop) {
 			len = c->cmn.resp_len;
 			buf = c->cmn.resp_buf;
 		} else {
@@ -240,7 +240,7 @@ static void srpc_worker(void *arg)
 	uint64_t st = microtime();
 	thread_t *th;
 
-	c->drop = false;
+	c->cmn.drop = false;
 	srpc_handler((struct srpc_ctx *)c);
 	st = microtime() - st;
 
@@ -311,7 +311,7 @@ again:
 		if (chdr.prio > atomic_read(&dagor_prio_thresh)) {
 			thread_t *th;
 
-			s->slots[idx]->drop = true;
+			s->slots[idx]->cmn.drop = true;
 			spin_lock_np(&s->lock);
 			bitmap_set(s->completed_slots, idx);
 			th = s->sender_th;

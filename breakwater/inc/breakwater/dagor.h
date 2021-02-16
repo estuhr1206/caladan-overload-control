@@ -15,7 +15,6 @@
 struct sdg_ctx {
 	struct srpc_ctx		cmn;
 	uint64_t		ts_sent;
-	bool			drop;
 };
 
 struct cdg_ctx {

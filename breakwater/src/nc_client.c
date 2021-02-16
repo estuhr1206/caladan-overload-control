@@ -183,7 +183,8 @@ again:
 	return shdr.len;
 }
 
-int cnc_open(struct netaddr raddr, struct crpc_session **sout, int id)
+int cnc_open(struct netaddr raddr, struct crpc_session **sout, int id,
+	     srpc_fn_t drop_handler)
 {
 	struct netaddr laddr;
 	struct cnc_session *s;
