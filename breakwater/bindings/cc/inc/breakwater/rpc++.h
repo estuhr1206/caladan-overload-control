@@ -1,4 +1,4 @@
-// rpc.h - support for remote procedure calls (RPCs)
+// rpc++.h - support for remote procedure calls (RPCs)
 
 #pragma once
 
