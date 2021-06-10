@@ -361,7 +361,7 @@ fail:
 }
 
 ssize_t csd_send_one(struct crpc_session *s_,
-		      const void *buf, size_t len, int hash)
+		      const void *buf, size_t len, int hash, void *arg)
 {
 	struct csd_session *s = (struct csd_session *)s_;
 	struct csd_conn *cc;
@@ -463,7 +463,7 @@ static void crpc_update_tb_rate(struct csd_conn *cc, uint64_t us)
 }
 
 ssize_t csd_recv_one(struct crpc_conn *cc_, void *buf, size_t len,
-		     uint64_t *latency)
+		     bool *dropped)
 {
 	struct csd_conn *cc = (struct csd_conn *)cc_;
 	struct ssd_hdr shdr;
@@ -506,6 +506,9 @@ ssize_t csd_recv_one(struct crpc_conn *cc_, void *buf, size_t len,
 		crpc_update_tb_rate(cc, us);
 		mutex_unlock(&cc->lock);
 
+		if (dropped)
+			*dropped = false;
+
 #if CSD_TRACK_FLOW
 		if (s->id == CSD_TRACK_FLOW_ID) {
 			printf("[%lu] ===> response: id=%lu\n",
@@ -524,7 +527,7 @@ ssize_t csd_recv_one(struct crpc_conn *cc_, void *buf, size_t len,
 
 
 int csd_open(struct netaddr raddr, struct crpc_session **sout, int id,
-	     srpc_fn_t drop_handler)
+	     crpc_fn_t drop_handler)
 {
 	struct netaddr laddr;
 	struct csd_session *s;

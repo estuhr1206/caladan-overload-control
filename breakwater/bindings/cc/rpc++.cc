@@ -26,13 +26,13 @@ int RpcClient::AddConnection(netaddr raddr) {
   return crpc_ops->crpc_add_connection(s_, raddr);
 }
 
-ssize_t RpcClient::Send(const void *buf, size_t len, int hash) {
-  return crpc_ops->crpc_send_one(s_, buf, len, hash);
+ssize_t RpcClient::Send(const void *buf, size_t len, int hash, void *arg) {
+  return crpc_ops->crpc_send_one(s_, buf, len, hash, arg);
 }
 
 ssize_t RpcClient::Recv(void *buf, size_t len, int conn_idx,
-			uint64_t *latency) {
-  return crpc_ops->crpc_recv_one(s_->c[conn_idx], buf, len, latency);
+			bool *dropped) {
+  return crpc_ops->crpc_recv_one(s_->c[conn_idx], buf, len, dropped);
 }
 
 int RpcClient::NumConns() {

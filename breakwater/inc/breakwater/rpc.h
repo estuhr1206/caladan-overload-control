@@ -65,6 +65,7 @@ struct crpc_ctx {
 	uint64_t		id;
 	uint64_t		ts;
 	char			buf[SRPC_BUF_SIZE];
+	void*			arg;
 };
 
 typedef void (*crpc_fn_t)(struct crpc_ctx *ctx);
@@ -102,7 +103,7 @@ struct crpc_ops {
 	 * errors (< 0).
 	 */
 	ssize_t (*crpc_send_one)(struct crpc_session *s,
-				 const void *buf, size_t len, int hash);
+				 const void *buf, size_t len, int hash, void *arg);
 	/**
 	 * crpc_recv_one - receive one RPC request
 	 * @s: the RPC session to receive from
@@ -115,7 +116,7 @@ struct crpc_ops {
 	 * socket errors (<= 0).
 	 */
 	ssize_t (*crpc_recv_one)(struct crpc_conn *s,
-				 void *buf, size_t len, uint64_t *latency);
+				 void *buf, size_t len, bool *dropped);
 
 	/**
 	 * crpc_open - creates an RPC session

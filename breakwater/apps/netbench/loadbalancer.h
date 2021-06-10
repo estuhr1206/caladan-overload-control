@@ -11,6 +11,7 @@ class LBCTX {
 public:
   LBCTX() {
     waiter = new rt::WaitGroup(1);
+    dropped = false;
   }
 
   ~LBCTX() {
@@ -18,11 +19,15 @@ public:
   }
 
   void Wait() { waiter->Wait(); }
+  void Done() { waiter->Done(); }
+  bool IsDropped() { return dropped; }
 
   // request from upstream
   T req;
   // response from downstream
   T resp;
+  // whether the request has been dropped in the downstream
+  bool dropped;
   // waiter for synchronization
   rt::WaitGroup *waiter;
 };
@@ -102,21 +107,19 @@ LoadBalancer<T, ID_OFF>::LoadBalancer(netaddr *raddrs, int nserver,
     for(int j = 0; j < clients_[i]->NumConns(); ++j) {
       rt::Thread([&, i, j] {
         T rp;
+	bool dropped;
 
 	while (true) {
-	  ssize_t ret = clients_[i]->Recv(&rp, sizeof(rp), j, nullptr);
+	  ssize_t ret = clients_[i]->Recv(&rp, sizeof(rp), j, &dropped);
 	  if (ret != static_cast<ssize_t>(sizeof(rp))) {
 	    if (ret == 0 || ret < 0) break;
 	    panic("read response from downstream failed, ret = %ld", ret);
 	  }
 
-	  /*
-	  uint64_t req_id = *(uint64_t *)((const char *)&rp + ID_OFF);
-	  LBCTX<T> *ctx = reinterpret_cast<LBCTX<T> *>(req_id);
-          */
 	  LBCTX<T> *ctx = GetCTX((char *)&rp);
 	  // copy response
 	  memcpy(&ctx->resp, &rp, sizeof(rp));
+	  ctx->dropped = dropped;
 
 	  // wake up the waiter
 	  ctx->waiter->Done();
@@ -149,7 +152,7 @@ LBCTX<T> *LoadBalancer<T, ID_OFF>::Send(const void *buf, size_t len, int hash) {
   next_cidx_ = (idx + 1) % nclients_;
 
   // Send the request
-  clients_[idx]->Send(req, len, hash);
+  clients_[idx]->Send(req, len, hash, nullptr);
 
   return ctx;
 }

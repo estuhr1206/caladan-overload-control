@@ -27,11 +27,11 @@ class RpcClient {
   int AddConnection(netaddr raddr);
 
   // Sends an RPC request.
-  ssize_t Send(const void *buf, size_t len, int hash);
+  ssize_t Send(const void *buf, size_t len, int hash, void *arg);
 
   // Receives an RPC request.
   ssize_t Recv(void *buf, size_t len, int conn_idx = 0,
-	       uint64_t *latency = nullptr);
+	       bool *dropped = nullptr);
 
   int NumConns();
 

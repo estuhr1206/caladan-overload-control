@@ -17,6 +17,8 @@ extern "C" {
 #include "breakwater/rpc++.h"
 
 #include "synthetic_worker.h"
+#include "loadbalancer.h"
+#include "fanouter.h"
 
 #include <atomic>
 #include <algorithm>
@@ -84,9 +86,18 @@ double offered_load;
 
 static SyntheticWorker *workers[NCPU];
 
-struct lb_ctx;
-rpc::RpcClient *lb_client[kNumDupClient];
-int next_lb_idx;
+struct payload {
+  uint64_t work_iterations;
+  uint64_t index;
+  uint64_t tsc_end;
+  uint32_t cpu;
+  uint64_t server_queue;
+  uint64_t hash;
+};
+constexpr int PAYLOAD_ID_OFF = offsetof(payload, index);
+
+rpc::LoadBalancer<payload, PAYLOAD_ID_OFF> *load_balancer[16];
+rpc::FanOuter<payload, PAYLOAD_ID_OFF> *fan_outer;
 
 /* server-side stat */
 constexpr uint64_t kRPCSStatPort = 8002;
@@ -448,14 +459,7 @@ shstat_raw ReadShenangoStat() {
 }
 
 constexpr uint64_t kNetbenchPort = 8001;
-struct payload {
-  bool success;
-  uint64_t work_iterations;
-  uint64_t index;
-  uint64_t tsc_end;
-  uint32_t cpu;
-  uint64_t server_queue;
-};
+
 
 // The maximum lateness to tolerate before dropping egress samples.
 constexpr uint64_t kMaxCatchUpUS = 5;
@@ -479,7 +483,6 @@ void RpcServer(struct srpc_ctx *ctx) {
   ctx->resp_len = sizeof(payload);
   payload *out = reinterpret_cast<payload *>(ctx->resp_buf);
   memcpy(out, in, sizeof(*out));
-  out->success = true;
   out->tsc_end = hton64(rdtscp(&out->cpu));
   out->cpu = hton32(out->cpu);
   out->server_queue = hton64(rt::RuntimeQueueUS());
@@ -500,14 +503,7 @@ void ServerHandler(void *arg) {
   rt::WaitGroup(1).Wait();
 }
 
-struct lb_ctx {
-  payload req;
-  payload resp;
-  rt::WaitGroup *waiter;
-};
-
 void LoadBalancer(struct srpc_ctx *ctx) {
-  uint32_t ds_win = 0;
   // Validate and parse the request
   if (unlikely(ctx->req_len != sizeof(payload))) {
     log_err("got invalid RPC len %ld", ctx->req_len);
@@ -515,108 +511,151 @@ void LoadBalancer(struct srpc_ctx *ctx) {
   }
   const payload *in = reinterpret_cast<const payload *>(ctx->req_buf);
 
-  // Craft sub-req
-  lb_ctx ds_ctx;
-  rt::WaitGroup resp_waiter(1);
-
-  memcpy(&ds_ctx.req, in, sizeof(ds_ctx.req));
-  ds_ctx.req.index = hton64(reinterpret_cast<uint64_t>(&ds_ctx));
-  ds_ctx.waiter = &resp_waiter;
-
-  int idx = next_lb_idx;
-
-  for(int i = 0; i < kNumDupClient; ++i) {
-    if (lb_client[idx]->WinAvail() > 0) break;
-    idx = (idx + 1) % kNumDupClient;
-  }
-
-  rpc::RpcClient *c = lb_client[idx];
-  next_lb_idx = (idx + 1) % kNumDupClient;
-
-  // Call to downstream
-  c->Send(&ds_ctx.req, sizeof(ds_ctx.req), 0);
-
-  // Wait for the response
-  resp_waiter.Wait();
-
-  for(int i = 0; i < kNumDupClient; ++i)
-    ds_win += lb_client[i]->WinAvail();
+  LBCTX<payload> *resp_ctx = load_balancer[0]->Send(
+			(void *)ctx->req_buf, sizeof(payload), in->hash);
+  resp_ctx->Wait();
 
   // Craft a response
   ctx->resp_len = sizeof(payload);
-  ctx->ds_win = ds_win;
-  ctx->drop = !ds_ctx.resp.success;
+  ctx->ds_win = load_balancer[0]->WinAvail();
+  ctx->drop = resp_ctx->IsDropped();
+
   payload *out = reinterpret_cast<payload *>(ctx->resp_buf);
   memcpy(out, in, sizeof(*out));
-  out->success = ds_ctx.resp.success;
+
   out->tsc_end = hton64(rdtscp(&out->cpu));
   out->cpu = hton32(out->cpu);
   out->server_queue = hton64(rt::RuntimeQueueUS());
+
+  delete resp_ctx;
 }
 
 void LBDropHandler(struct crpc_ctx *c) {
-  const payload *rp = reinterpret_cast<const payload *>(c->buf);
-  lb_ctx *ctx = reinterpret_cast<lb_ctx *>(ntoh64(rp->index));
+  LBCTX<payload> *ctx =
+	  rpc::LoadBalancer<payload, PAYLOAD_ID_OFF>::GetCTX(c->buf);
 
-  ctx->resp.success = false;
-  ctx->waiter->Done();
+  memcpy(&ctx->resp, c->buf, c->len);
+  ctx->dropped = true;
+  ctx->Done();
 }
 
 void LBHandler(void *arg) {
   rt::Thread([] { RPCSStatServer(); }).Detach();
-  int server_idx;
-  int conn_idx;
 
-  next_lb_idx = 0;
-  for (int i = 0; i < kNumDupClient; ++i) {
-    /* Dial to the first connection */
-    lb_client[i] = rpc::RpcClient::Dial(raddr[0], 1, LBDropHandler);
-
-    /* Add connections to the replica */
-    if (nconn[0] > 1) {
-      server_idx = 0;
-      conn_idx = 1;
-    } else {
-      server_idx = 1;
-      conn_idx = 0;
-    }
-
-    while (server_idx < num_servers) {
-      lb_client[i]->AddConnection(raddr[server_idx]);
-      if (++conn_idx >= nconn[server_idx]) {
-        server_idx++;
-        conn_idx = 0;
-      }
-    }
-
-    // Start the receiver thread for downstream
-    for(int j = 0; j < lb_client[i]->NumConns(); ++j) {
-      rt::Thread([&, i, j] {
-        payload rp;
-
-        while (true) {
-          ssize_t ret = lb_client[i]->Recv(&rp, sizeof(rp), j, nullptr);
-	if (ret != static_cast<ssize_t>(sizeof(rp))) {
-	  if (ret == 0 || ret < 0) break;
-	  panic("read failed, ret = %ld", ret);
-	}
-
-	uint64_t idx = ntoh64(rp.index);
-	lb_ctx *ctx = reinterpret_cast<lb_ctx *>(idx);
-
-	/* copy response */
-	memcpy(&ctx->resp, &rp, sizeof(rp));
-
-	/* wake up request */
-	ctx->waiter->Done();
-        }
-      }).Detach();
-    }
-  }
+  load_balancer[0] = new rpc::LoadBalancer<payload, PAYLOAD_ID_OFF>(raddr,
+			num_servers, kNumDupClient, nconn[0], LBDropHandler);
 
   /* Start Server */
   int ret = rpc::RpcServerEnable(LoadBalancer);
   if (ret) panic("couldn't start LB server");
+  // waits forever.
+  rt::WaitGroup(1).Wait();
+}
+
+void FanOut(struct srpc_ctx *ctx) {
+  // Validate and parse the request
+  if (unlikely(ctx->req_len != sizeof(payload))) {
+    log_err("got invalid RPC len %ld", ctx->req_len);
+    return;
+  }
+  const payload *in = reinterpret_cast<const payload *>(ctx->req_buf);
+
+  FOCTX<payload> *resp_ctx = fan_outer->Send(
+			(void *)ctx->req_buf, sizeof(payload), in->hash);
+
+  resp_ctx->Wait();
+
+  // Craft a response
+  ctx->resp_len = sizeof(payload);
+  ctx->ds_win = fan_outer->WinAvail();
+  ctx->drop = resp_ctx->IsDropped();
+
+  payload *out = reinterpret_cast<payload *>(ctx->resp_buf);
+  memcpy(out, in, sizeof(*out));
+
+  out->tsc_end = hton64(rdtscp(&out->cpu));
+  out->cpu = hton32(out->cpu);
+  out->server_queue = hton64(rt::RuntimeQueueUS());
+
+  delete resp_ctx;
+}
+
+void FODropHandler(struct crpc_ctx *c) {
+  FOCTX<payload> *ctx = rpc::FanOuter<payload, PAYLOAD_ID_OFF>::GetCTX(c->buf);
+  int idx = ctx->num_resp++;
+
+  memcpy(&ctx->resp[idx], c->buf, c->len);
+  ctx->dropped[idx] = true;
+  ctx->Done();
+}
+
+void FOHandler(void *arg) {
+  rt::Thread([] { RPCSStatServer(); }).Detach();
+
+  fan_outer = new rpc::FanOuter<payload, PAYLOAD_ID_OFF>(raddr,
+			num_servers, kNumDupClient, nconn[0], FODropHandler);
+
+  /* Start server */
+  int ret = rpc::RpcServerEnable(FanOut);
+  if (ret) panic("couldn't start FO server");
+  // waits forever.
+  rt::WaitGroup(1).Wait();
+}
+
+void Sequential(struct srpc_ctx *ctx) {
+  uint64_t ds_win;
+  bool success = true;
+  // Validate and parse the request
+  if (unlikely(ctx->req_len != sizeof(payload))) {
+    log_err("got invalid RPC len %ld", ctx->req_len);
+    return;
+  }
+  const payload *in = reinterpret_cast<const payload *>(ctx->req_buf);
+
+  LBCTX<payload> *resp_ctx;
+  for(int i = 0; i < num_servers; ++i) {
+    resp_ctx = load_balancer[i]->Send(
+			(void *)ctx->req_buf, sizeof(payload), in->hash);
+    resp_ctx->Wait();
+
+    if (resp_ctx->IsDropped()) {
+      success = false;
+      break;
+    }
+  }
+
+  ds_win = load_balancer[0]->WinAvail();
+  for (int i = 1; i < num_servers; ++i) {
+    ds_win = MIN(ds_win, load_balancer[i]->WinAvail());
+  }
+
+  // Craft a response
+  ctx->resp_len = sizeof(payload);
+  ctx->ds_win = ds_win;
+  ctx->drop = !success;
+
+  payload *out = reinterpret_cast<payload *>(ctx->resp_buf);
+  memcpy(out, in, sizeof(*out));
+
+  out->tsc_end = hton64(rdtscp(&out->cpu));
+  out->cpu = hton32(out->cpu);
+  out->server_queue = hton64(rt::RuntimeQueueUS());
+
+  delete resp_ctx;
+}
+
+
+void SEQHandler(void *arg) {
+  rt::Thread([] { RPCSStatServer(); }).Detach();
+
+  for(int i = 0; i < num_servers; ++i) {
+    load_balancer[i] = new rpc::LoadBalancer<payload, PAYLOAD_ID_OFF>(
+			raddr + i, 1, kNumDupClient, nconn[i], LBDropHandler);
+  }
+
+  /* Start server */
+  int ret = rpc::RpcServerEnable(Sequential);
+  if (ret) panic("couldn't start FO server");
   // waits forever.
   rt::WaitGroup(1).Wait();
 }
@@ -670,10 +709,10 @@ std::vector<work_unit> ClientWorker(
   for(int i = 0; i < c->NumConns(); ++i) {
     ths.emplace_back(rt::Thread([&, i] {
       payload rp;
-      uint64_t latency;
+      bool dropped;
 
       while (true) {
-        ssize_t ret = c->Recv(&rp, sizeof(rp), i, &latency);
+        ssize_t ret = c->Recv(&rp, sizeof(rp), i, &dropped);
         if (ret != static_cast<ssize_t>(sizeof(rp))) {
           if (ret == 0 || ret < 0) break;
           panic("read failed, ret = %ld", ret);
@@ -682,19 +721,16 @@ std::vector<work_unit> ClientWorker(
         uint64_t now = microtime();
         uint64_t idx = ntoh64(rp.index);
 
-        if (!rp.success) {
-          w[idx].duration_us = latency;
-          w[idx].success = false;
-          continue;
-        }
-
         w[idx].duration_us = now - timings[idx];
+	w[idx].success = !dropped;
+
+	if (dropped) continue;
+
         w[idx].window = c->WinAvail();
         w[idx].tsc = ntoh64(rp.tsc_end);
         w[idx].cpu = ntoh32(rp.cpu);
         w[idx].server_queue = ntoh64(rp.server_queue);
         w[idx].server_time = w[idx].work_us + w[idx].server_queue;
-        w[idx].success = true;
       }
     }));
   }
@@ -729,10 +765,10 @@ std::vector<work_unit> ClientWorker(
     timings[i] = microtime();
 
     // Send an RPC request.
-    p.success = false;
     p.work_iterations = hton64(w[i].work_us * kIterationsPerUS);
     p.index = hton64(i);
-    ssize_t ret = c->Send(&p, sizeof(p), w[i].hash);
+    p.hash = w[i].hash;
+    ssize_t ret = c->Send(&p, sizeof(p), w[i].hash, nullptr);
     if (ret == -ENOBUFS) continue;
     if (ret != static_cast<ssize_t>(sizeof(p)))
       panic("write failed, ret = %ld", ret);
@@ -759,7 +795,7 @@ std::vector<work_unit> RunExperiment(
   int conn_idx;
 
   for (int i = 0; i < threads; ++i) {
-    std::unique_ptr<rpc::RpcClient> outc(rpc::RpcClient::Dial(raddr[0], i + 1, nullptr));
+    std::unique_ptr<rpc::RpcClient> outc(rpc::RpcClient::Dial(raddr[0], i+1, nullptr));
     if (unlikely(outc == nullptr)) panic("couldn't connect to raddr.");
 
     if (nconn[0] > 1) {
@@ -777,7 +813,6 @@ std::vector<work_unit> RunExperiment(
 	conn_idx = 0;
       }
     }
-
     clients.emplace_back(std::move(outc));
   }
 
@@ -871,10 +906,10 @@ std::vector<work_unit> RunExperiment(
     offered += v.size();
     // Remove requests that did not complete.
     v.erase(std::remove_if(v.begin(), v.end(),
-                           [](const work_unit &s) {
-                             return (s.duration_us == 0 ||
-                                     (s.start_us + s.duration_us) < kWarmUpTime);
-                           }),
+                        [](const work_unit &s) {
+                          return (s.duration_us == 0 ||
+                                 (s.start_us + s.duration_us) < kWarmUpTime);
+                        }),
             v.end());
     resp_success = std::count_if(v.begin(), v.end(), [](const work_unit &s) {
       return s.success;
@@ -1333,6 +1368,24 @@ void print_lb_usage() {
 	    << std:: endl;
 }
 
+void print_fo_usage() {
+  std::cerr << "usage: [alg] [cfg_file] fo [server_ip #1] [nconn #1]\n"
+	    << "\talg: overload control algorithms (breakwater/seda/dagor)\n"
+	    << "\tcfg_file: Shenango configuration file\n"
+	    << "\tserver_ip: server IP address\n"
+	    << "\tnconn: the number of parallel connection to the server"
+	    << std:: endl;
+}
+
+void print_seq_usage() {
+  std::cerr << "usage: [alg] [cfg_file] seq [server_ip #1] [nconn #1]\n"
+	    << "\talg: overload control algorithms (breakwater/seda/dagor)\n"
+	    << "\tcfg_file: Shenango configuration file\n"
+	    << "\tserver_ip: server IP address\n"
+	    << "\tnconn: the number of parallel connection to the server"
+	    << std:: endl;
+}
+
 void print_client_usage() {
   std::cerr << "usage: [alg] [cfg_file] client [nclients] "
       << "[service_us] [service_dist] [slo] [nagents] "
@@ -1432,6 +1485,66 @@ int main(int argc, char *argv[]) {
     }
 
     ret = runtime_init(argv[2], LBHandler, NULL);
+    if (ret) {
+      std::cerr << "[Error] Failed to start runtime" << std::endl;
+      return ret;
+    }
+  } else if (cmd.compare("fo") == 0) {
+    // Load-Balancer
+    if (argc < 6) {
+      print_fo_usage();
+      return -EINVAL;
+    }
+
+    num_servers = argc - 4;
+    if (num_servers % 2 != 0) {
+      print_fo_usage();
+      return -EINVAL;
+    }
+    num_servers /= 2;
+
+    for (i = 0; i < num_servers; ++i) {
+      ret = StringToAddr(argv[4+2*i], &raddr[i].ip);
+      if (ret) {
+        std::cerr << "[Error] Cannot parse server IP: " << argv[4+2*i]
+		  << std::endl;
+	return -EINVAL;
+      }
+      raddr[i].port = kNetbenchPort;
+      nconn[i] = std::stoi(argv[5+2*i], nullptr, 0);
+    }
+
+    ret = runtime_init(argv[2], FOHandler, NULL);
+    if (ret) {
+      std::cerr << "[Error] Failed to start runtime" << std::endl;
+      return ret;
+    }
+  } else if (cmd.compare("seq") == 0) {
+    // Load-Balancer
+    if (argc < 6) {
+      print_seq_usage();
+      return -EINVAL;
+    }
+
+    num_servers = argc - 4;
+    if (num_servers % 2 != 0) {
+      print_seq_usage();
+      return -EINVAL;
+    }
+    num_servers /= 2;
+
+    for (i = 0; i < num_servers; ++i) {
+      ret = StringToAddr(argv[4+2*i], &raddr[i].ip);
+      if (ret) {
+        std::cerr << "[Error] Cannot parse server IP: " << argv[4+2*i]
+		  << std::endl;
+	return -EINVAL;
+      }
+      raddr[i].port = kNetbenchPort;
+      nconn[i] = std::stoi(argv[5+2*i], nullptr, 0);
+    }
+
+    ret = runtime_init(argv[2], SEQHandler, NULL);
     if (ret) {
       std::cerr << "[Error] Failed to start runtime" << std::endl;
       return ret;

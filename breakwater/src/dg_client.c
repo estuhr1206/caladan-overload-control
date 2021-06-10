@@ -217,7 +217,7 @@ fail:
 }
 
 ssize_t cdg_send_one(struct crpc_session *s_,
-		      const void *buf, size_t len, int hash)
+		      const void *buf, size_t len, int hash, void *arg)
 {
 	struct cdg_session *s = (struct cdg_session *)s_;
 
@@ -235,12 +235,11 @@ ssize_t cdg_send_one(struct crpc_session *s_,
 }
 
 ssize_t cdg_recv_one(struct crpc_conn *cc_, void *buf, size_t len,
-		     uint64_t *latency)
+		     bool *dropped)
 {
 	struct cdg_conn *cc = (struct cdg_conn *)cc_;
 	struct sdg_hdr shdr;
 	ssize_t ret;
-	uint64_t now;
 
 	/* read the server header */
 	ret = tcp_read_full(cc->cmn.c, &shdr, sizeof(shdr));
@@ -259,7 +258,6 @@ ssize_t cdg_recv_one(struct crpc_conn *cc_, void *buf, size_t len,
 		return -EINVAL;
 	}
 
-	now = microtime();
 	switch (shdr.op) {
 	case DG_OP_CALL:
 		/* read the payload */
@@ -275,12 +273,12 @@ ssize_t cdg_recv_one(struct crpc_conn *cc_, void *buf, size_t len,
 		cc->local_prio = shdr.prio;
 		mutex_unlock(&cc->lock);
 
-		if ((shdr.flags & DG_SFLAG_DROP) && latency)
-			*latency = now - shdr.ts_sent;
+		if (dropped)
+			*dropped = (shdr.flags & DG_SFLAG_DROP);
 #if CDG_TRACK_FLOW
 		if (s->id == CDG_TRACK_FLOW_ID) {
 			printf("[%lu] ===> response: id=%lu, prio=%d\n",
-			       now, shdr.id, shdr.prio);
+			       microtime(), shdr.id, shdr.prio);
 		}
 #endif
 
@@ -294,7 +292,7 @@ ssize_t cdg_recv_one(struct crpc_conn *cc_, void *buf, size_t len,
 }
 
 int cdg_open(struct netaddr raddr, struct crpc_session **sout, int id,
-	     srpc_fn_t drop_handler)
+	     crpc_fn_t drop_handler)
 {
 	struct netaddr laddr;
 	struct cdg_session *s;

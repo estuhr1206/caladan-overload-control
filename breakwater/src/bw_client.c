@@ -232,7 +232,7 @@ static void crpc_drain_queue(struct cbw_session *s)
 }
 
 static bool crpc_enqueue_one(struct cbw_session *s,
-			     const void *buf, size_t len)
+			     const void *buf, size_t len, void *arg)
 {
 	int pos;
 	struct crpc_ctx *c;
@@ -243,6 +243,12 @@ static bool crpc_enqueue_one(struct cbw_session *s,
 
 	/* if the queue is full, drop tail */
 	if (s->head - s->tail >= CRPC_QLEN) {
+		pos = s->tail % CRPC_QLEN;
+		c = s->qreq[pos];
+
+		if (s->cmn.drop_handler)
+			s->cmn.drop_handler(c);
+
 		s->tail++;
 		s->req_dropped_++;
 #if CBW_TRACK_FLOW
@@ -259,6 +265,7 @@ static bool crpc_enqueue_one(struct cbw_session *s,
 	c->id = s->req_id++;
 	c->ts = now;
 	c->len = len;
+	c->arg = arg;
 
 #if CBW_TRACK_FLOW
 	if (s->id == CBW_TRACK_FLOW_ID) {
@@ -328,8 +335,8 @@ fail:
 	return -ENOMEM;
 }
 
-ssize_t cbw_send_one(struct crpc_session *s_,
-		      const void *buf, size_t len, int hash)
+ssize_t cbw_send_one(struct crpc_session *s_, const void *buf, size_t len,
+		     int hash, void *arg)
 {
 	struct cbw_session *s = (struct cbw_session *)s_;
 	struct cbw_conn *cc;
@@ -352,7 +359,7 @@ ssize_t cbw_send_one(struct crpc_session *s_,
 	}
 
 	/* cold path, enqueue request and drain the queue */
-	if (!crpc_enqueue_one(s, buf, len)) {
+	if (!crpc_enqueue_one(s, buf, len, arg)) {
 		crpc_drain_queue(s);
 		mutex_unlock(&s->lock);
 		return -ENOBUFS;
@@ -364,13 +371,12 @@ ssize_t cbw_send_one(struct crpc_session *s_,
 }
 
 ssize_t cbw_recv_one(struct crpc_conn *cc_, void *buf, size_t len,
-		     uint64_t *latency)
+		     bool *dropped)
 {
 	struct cbw_conn *cc = (struct cbw_conn *)cc_;
 	struct cbw_session *s = cc->session;
 	struct sbw_hdr shdr;
 	ssize_t ret;
-	uint64_t now;
 
 again:
 	/* read the server header */
@@ -390,7 +396,6 @@ again:
 		return -EINVAL;
 	}
 
-	now = microtime();
 	switch (shdr.op) {
 	case BW_OP_CALL:
 		/* read the payload */
@@ -413,7 +418,7 @@ again:
 #if CBW_TRACK_FLOW
 		if (s->id == CBW_TRACK_FLOW_ID) {
 			printf("[%lu] ===> response: id=%lu, shdr.win=%lu, win=%u/%u\n",
-			       now, shdr.id, shdr.win, cc->win_used, cc->win_avail);
+			       microtime(), shdr.id, shdr.win, cc->win_used, cc->win_avail);
 		}
 #endif
 
@@ -421,9 +426,8 @@ again:
 			crpc_drain_queue(s);
 		}
 
-		if ((shdr.flags & BW_SFLAG_DROP) && latency) {
-			*latency = now - shdr.ts_sent;
-		}
+		if (dropped)
+			*dropped = (shdr.flags & BW_SFLAG_DROP);
 
 		mutex_unlock(&s->lock);
 
