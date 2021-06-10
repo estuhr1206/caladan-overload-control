@@ -24,12 +24,19 @@
 #include <net/mbuf.h>
 
 #include "defs.h"
+#include "net/defs.h"
 
 #define PACKET_QUEUE_MCOUNT	4096
 #define COMMAND_QUEUE_MCOUNT	4096
+
 /* the egress buffer pool must be large enough to fill all the TXQs entirely */
-#define EGRESS_POOL_SIZE(nks) \
-	(PACKET_QUEUE_MCOUNT * MBUF_DEFAULT_LEN * MAX(1, guaranteedks) * 8UL)
+static size_t calculate_egress_pool_size(void)
+{
+	size_t buflen = MBUF_DEFAULT_LEN;
+	return align_up(PACKET_QUEUE_MCOUNT *
+			buflen * MAX(1, guaranteedks) * 8UL,
+			PGSIZE_2MB);
+}
 
 struct iokernel_control iok;
 bool cfg_prio_is_lc;
@@ -91,16 +98,14 @@ static size_t estimate_shm_space(void)
 	ret = align_up(ret, PGSIZE_2MB);
 
 	// Egress buffers
-	BUILD_ASSERT(ETH_MAX_LEN + sizeof(struct tx_net_hdr) <=
-			MBUF_DEFAULT_LEN);
 	BUILD_ASSERT(PGSIZE_2MB % MBUF_DEFAULT_LEN == 0);
-	ret += EGRESS_POOL_SIZE(maxks);
+	ret += calculate_egress_pool_size();
 	ret = align_up(ret, PGSIZE_2MB);
 
 #ifdef DIRECTPATH
 	// mlx5 directpath
 	if (cfg_directpath_enabled)
-		ret += PGSIZE_2MB;
+		ret += PGSIZE_2MB * 4;
 #endif
 
 #ifdef DIRECT_STORAGE
@@ -212,7 +217,7 @@ int ioqueues_init(void)
 		ts->rxq.wb = ts->q_ptrs;
 	}
 
-	iok.tx_len = EGRESS_POOL_SIZE(maxks);
+	iok.tx_len = calculate_egress_pool_size();
 	iok.tx_buf = iok_shm_alloc(iok.tx_len, PGSIZE_2MB, NULL);
 
 	return 0;
@@ -240,7 +245,8 @@ int ioqueues_register_iokernel(void)
 	BUG_ON((uintptr_t)iok.hdr != (uintptr_t)r->base);
 	hdr->magic = CONTROL_HDR_MAGIC;
 	hdr->version_no = CONTROL_HDR_VERSION;
-	hdr->egress_buf_count = div_up(iok.tx_len, MBUF_DEFAULT_LEN);
+	/* TODO: overestimating is okay, but fix this later */
+	hdr->egress_buf_count = div_up(iok.tx_len, net_get_mtu() + MBUF_HEAD_LEN);
 	hdr->thread_count = maxks;
 	hdr->mac = netcfg.mac;
 

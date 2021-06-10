@@ -21,13 +21,12 @@
 /* important global state */
 struct net_cfg netcfg __aligned(CACHE_LINE_SIZE);
 struct net_driver_ops net_ops;
+unsigned int eth_mtu = ETH_DEFAULT_MTU;
 
 /* TX buffer allocation */
 struct mempool net_tx_buf_mp;
 static struct tcache *net_tx_buf_tcache;
 static DEFINE_PERTHREAD(struct tcache_perthread, net_tx_buf_pt);
-
-#define MBUF_RESERVED (align_up(sizeof(struct mbuf), CACHE_LINE_SIZE))
 
 
 /*
@@ -83,16 +82,16 @@ static struct mbuf *net_rx_alloc_mbuf(struct rx_net_hdr *hdr)
 	void *buf;
 
 	/* allocate the buffer to store the payload */
-	m = smalloc(hdr->len + MBUF_RESERVED);
+	m = smalloc(hdr->len + MBUF_HEAD_LEN);
 	if (unlikely(!m))
 		goto out;
 
-	buf = (unsigned char *)m + MBUF_RESERVED;
+	buf = (unsigned char *)m + MBUF_HEAD_LEN;
 
 	/* copy the payload and release the buffer back to the iokernel */
 	memcpy(buf, hdr->payload, hdr->len);
 
-	mbuf_init(m, buf, MBUF_DEFAULT_LEN - MBUF_RESERVED, 0);
+	mbuf_init(m, buf, hdr->len, 0);
 	m->len = hdr->len;
 	m->csum_type = hdr->csum_type;
 	m->csum = hdr->csum;
@@ -137,7 +136,7 @@ void net_error(struct mbuf *m, int err)
 		trans_error(m, err);
 }
 
-static struct mbuf *net_rx_one(struct mbuf *m)
+static void net_rx_one(struct mbuf *m)
 {
 	const struct eth_hdr *llhdr;
 	const struct ip_hdr *iphdr;
@@ -157,7 +156,7 @@ static struct mbuf *net_rx_one(struct mbuf *m)
 	/* handle ARP requests */
 	if (ntoh16(llhdr->type) == ETHTYPE_ARP) {
 		net_rx_arp(m);
-		return NULL;
+		return;
 	}
 
 	/* filter out requests we can't handle */
@@ -185,7 +184,6 @@ static struct mbuf *net_rx_one(struct mbuf *m)
 
 	if (unlikely(!ip_hdr_supported(iphdr)))
 		goto drop;
-
 	len = ntoh16(iphdr->len) - sizeof(*iphdr);
 	if (unlikely(mbuf_length(m) < len))
 		goto drop;
@@ -199,71 +197,79 @@ static struct mbuf *net_rx_one(struct mbuf *m)
 
 	case IPPROTO_UDP:
 	case IPPROTO_TCP:
-		return m;
+		net_rx_trans(m);
+		break;
 
 	default:
 		goto drop;
 	}
 
-	return NULL;
+	return;
 
 drop:
 	mbuf_drop(m);
-	return NULL;
 }
 
 /**
- * net_rx_softirq_direct - handles ingress packet processing
- * This variant is intended for packets from directpath queues
+ * net_rx_batch - handles a batch of ingress packets
  * @ms: an array of ingress packets
  * @nr: the size of the @ms array
  */
-void net_rx_softirq_direct(struct mbuf **ms, unsigned int nr)
+void net_rx_batch(struct mbuf **ms, unsigned int nr)
 {
-	struct mbuf *l4_reqs[SOFTIRQ_MAX_BUDGET];
-	int i, l4idx = 0;
+	int i;
 
 	for (i = 0; i < nr; i++) {
 		if (i + RX_PREFETCH_STRIDE < nr)
 			prefetch(ms[i + RX_PREFETCH_STRIDE]->data);
-		l4_reqs[l4idx] = net_rx_one(ms[i]);
-		if (l4_reqs[l4idx] != NULL)
-			l4idx++;
+		net_rx_one(ms[i]);
 	}
-
-	/* handle transport protocol layer */
-	if (l4idx > 0)
-		net_rx_trans(l4_reqs, l4idx);
 }
 
-/**
- * net_rx_softirq - handles ingress packet processing
- * This variant is intended for packets from the IOKernel
- * @hdrs: an array of ingress packet headers
- * @nr: the size of the @hdrs array
- */
-void net_rx_softirq(struct rx_net_hdr **hdrs, unsigned int nr)
+static void iokernel_softirq_poll(struct kthread *k)
 {
+	struct rx_net_hdr *hdr;
 	struct mbuf *m;
-	struct mbuf *l4_reqs[SOFTIRQ_MAX_BUDGET];
-	int i, l4idx = 0;
+	uint64_t cmd;
+	unsigned long payload;
 
-	for (i = 0; i < nr; i++) {
-		if (i + RX_PREFETCH_STRIDE < nr)
-			prefetch(hdrs[i + RX_PREFETCH_STRIDE]);
-		m = net_rx_alloc_mbuf(hdrs[i]);
-		if (unlikely(!m)) {
-			STAT(DROPS)++;
-			continue;
+	while (true) {
+		if (!lrpc_recv(&k->rxq, &cmd, &payload))
+			break;
+
+		switch (cmd) {
+		case RX_NET_RECV:
+			hdr = shmptr_to_ptr(&netcfg.rx_region,
+					    (shmptr_t)payload,
+					    MBUF_DEFAULT_LEN);
+			m = net_rx_alloc_mbuf(hdr);
+			if (unlikely(!m)) {
+				STAT(DROPS)++;
+				continue;
+			}
+			net_rx_one(m);
+			break;
+
+		case RX_NET_COMPLETE:
+			mbuf_free((struct mbuf *)payload);
+			break;
+
+		default:
+			panic("net: invalid RXQ cmd '%ld'", cmd);
 		}
-		l4_reqs[l4idx] = net_rx_one(m);
-		if (l4_reqs[l4idx] != NULL)
-			l4idx++;
 	}
+}
 
-	/* handle transport protocol layer */
-	if (l4idx > 0)
-		net_rx_trans(l4_reqs, l4idx);
+static void iokernel_softirq(void *arg)
+{
+	struct kthread *k = arg;
+
+	while (true) {
+		iokernel_softirq_poll(k);
+		preempt_disable();
+		k->iokernel_busy = false;
+		thread_park_and_preempt_enable();
+	}
 }
 
 
@@ -302,13 +308,10 @@ struct mbuf *net_tx_alloc_mbuf(void)
 		log_warn_ratelimited("net: out of tx buffers");
 		return NULL;
 	}
-
 	preempt_enable();
 
-	buf = (unsigned char *)m + MBUF_RESERVED;
-
-	mbuf_init(m, buf, MBUF_DEFAULT_LEN - MBUF_RESERVED,
-		  MBUF_DEFAULT_HEADROOM);
+	buf = (unsigned char *)m + MBUF_HEAD_LEN;
+	mbuf_init(m, buf, net_get_mtu(), MBUF_DEFAULT_HEADROOM);
 	m->csum_type = CHECKSUM_TYPE_NEEDED;
 	m->txflags = 0;
 	m->release_data = 0;
@@ -388,11 +391,8 @@ static void net_tx_raw(struct mbuf *m)
  * header will be prepended by this function.
  *
  * @m must have been allocated with net_tx_alloc_mbuf().
- *
- * Returns 0 if successful. If successful, the mbuf will be freed when the
- * transmit completes. Otherwise, the mbuf still belongs to the caller.
  */
-int net_tx_eth(struct mbuf *m, uint16_t type, struct eth_addr dhost)
+void net_tx_eth(struct mbuf *m, uint16_t type, struct eth_addr dhost)
 {
 	struct eth_hdr *eth_hdr;
 
@@ -401,7 +401,6 @@ int net_tx_eth(struct mbuf *m, uint16_t type, struct eth_addr dhost)
 	eth_hdr->dhost = dhost;
 	eth_hdr->type = hton16(type);
 	net_tx_raw(m);
-	return 0;
 }
 
 static void net_push_iphdr(struct mbuf *m, uint8_t proto, uint32_t daddr)
@@ -472,8 +471,7 @@ int net_tx_ip(struct mbuf *m, uint8_t proto, uint32_t daddr)
 		}
 	}
 
-	ret = net_tx_eth(m, ETHTYPE_IP, dhost);
-	assert(!ret); /* can't fail as implemented so far */
+	net_tx_eth(m, ETHTYPE_IP, dhost);
 	return 0;
 }
 
@@ -528,10 +526,8 @@ int net_tx_ip_burst(struct mbuf **ms, int n, uint8_t proto, uint32_t daddr)
 	}
 
 	/* finally, transmit the packets */
-	for (i = 0; i < n; i++) {
-		ret = net_tx_eth(ms[i], ETHTYPE_IP, dhost);
-		assert(!ret); /* can't fail as implemented so far */
-	}
+	for (i = 0; i < n; i++)
+		net_tx_eth(ms[i], ETHTYPE_IP, dhost);
 
 	return 0;
 }
@@ -569,10 +565,17 @@ int str_to_netaddr(const char *str, struct netaddr *addr)
  */
 int net_init_thread(void)
 {
+	struct kthread *k = myk();
+	thread_t *th;
+
+	th = thread_create(iokernel_softirq, k);
+	if (!th)
+		return -ENOMEM;
+
+	k->iokernel_softirq = th;
 	tcache_init_perthread(net_tx_buf_tcache, &perthread_get(net_tx_buf_pt));
 	return 0;
 }
-
 
 static void net_dump_config(void)
 {
@@ -582,14 +585,10 @@ static void net_dump_config(void)
 	log_info("  addr:\t%s", ip_addr_to_str(netcfg.addr, buf));
 	log_info("  netmask:\t%s", ip_addr_to_str(netcfg.netmask, buf));
 	log_info("  gateway:\t%s", ip_addr_to_str(netcfg.gateway, buf));
-	log_info("  mac:\t%02X:%02X:%02X:%02X:%02X:%02X",
+	log_info("  mac:\t\t%02X:%02X:%02X:%02X:%02X:%02X",
 		 netcfg.mac.addr[0], netcfg.mac.addr[1], netcfg.mac.addr[2],
 		 netcfg.mac.addr[3], netcfg.mac.addr[4], netcfg.mac.addr[5]);
-}
-
-static int rx_batch_iokernel(struct hardware_q *rxq, struct mbuf **ms, unsigned int budget)
-{
-	return 0;
+	log_info("  mtu:\t\t%d", net_get_mtu());
 }
 
 static int steer_flows_iokernel(unsigned int *new_fg_assignment)
@@ -597,7 +596,9 @@ static int steer_flows_iokernel(unsigned int *new_fg_assignment)
 	return 0;
 }
 
-static int register_flow_iokernel(unsigned int affininty, struct trans_entry *e, void **handle_out)
+static int
+register_flow_iokernel(unsigned int affininty, struct trans_entry *e,
+		       void **handle_out)
 {
 	return 0;
 }
@@ -608,7 +609,6 @@ static int deregister_flow_iokernel(struct trans_entry *e, void *handle)
 }
 
 static struct net_driver_ops iokernel_ops = {
-	.rx_batch = rx_batch_iokernel,
 	.tx_single = net_tx_iokernel,
 	.steer_flows = steer_flows_iokernel,
 	.register_flow =  register_flow_iokernel,
@@ -625,8 +625,9 @@ int net_init(void)
 {
 	int ret;
 
-	ret = mempool_create(&net_tx_buf_mp, iok.tx_buf, iok.tx_len,
-			     PGSIZE_2MB, MBUF_DEFAULT_LEN);
+	ret = mempool_create(&net_tx_buf_mp, iok.tx_buf, iok.tx_len, PGSIZE_2MB,
+			     align_up(net_get_mtu() + MBUF_HEAD_LEN + MBUF_DEFAULT_HEADROOM,
+				      CACHE_LINE_SIZE * 2));
 	if (ret)
 		return ret;
 

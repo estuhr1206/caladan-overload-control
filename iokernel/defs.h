@@ -9,6 +9,7 @@
 #include <base/gen.h>
 #include <base/lrpc.h>
 #include <base/mem.h>
+#include <base/pci.h>
 #undef LIST_HEAD /* hack to deal with DPDK being annoying */
 #include <base/list.h>
 #include <iokernel/control.h>
@@ -26,6 +27,7 @@
 struct iokernel_cfg {
 	bool	noht; /* disable hyperthreads */
 	bool	nobw; /* disable bandwidth controller */
+	bool	noidlefastwake; /* disable fast wakeups for idle processes */
 	bool	ias_prefer_selfpair; /* prefer self-pairings */
 	float	ias_bw_limit; /* IAS bw limit, (MB/s) */
 	bool	no_hw_qdel; /* Disable use of hardware timestamps for qdelay */
@@ -338,6 +340,8 @@ extern int dp_clients_init(void);
 extern int dpdk_late_init(void);
 extern int hw_timestamp_init(void);
 
+extern char *nic_pci_addr_str;
+extern struct pci_addr nic_pci_addr;
 extern bool allowed_cores_supplied;
 extern DEFINE_BITMAP(input_allowed_cores, NCPU);
 

@@ -149,8 +149,6 @@ static int parse_runtime_guaranteed_kthreads(const char *name, const char *val)
 		log_err("invalid number of guaranteed kthreads requested, '%ld'", tmp);
 		log_err("must be < %d (number of CPUs)", cpu_count);
 		return -EINVAL;
-	} else if (tmp < 1) {
-		log_warn("< 1 guaranteed kthreads is not recommended for networked apps");
 	}
 
 	guaranteedks = tmp;
@@ -213,6 +211,25 @@ static int parse_mac_address(const char *name, const char *val)
 	if (ret)
 		log_err("Could not parse mac address: %s", val);
 	return ret;
+}
+
+static int parse_mtu(const char *num, const char *val)
+{
+	long tmp;
+	int ret;
+
+	ret = str_to_long(val, &tmp);
+	if (ret)
+		return ret;
+
+	if (tmp < 0 || tmp > ETH_MAX_MTU) {
+		log_err("MTU must be positive and <= %d, got %ld",
+			ETH_MAX_MTU, tmp);
+		return -EINVAL;
+	}
+
+	eth_mtu = tmp;
+	return 0;
 }
 
 static int parse_watchdog_flag(const char *name, const char *val)
@@ -308,12 +325,12 @@ static int parse_enable_directpath(const char *name, const char *val)
 static int parse_enable_gc(const char *name, const char *val)
 {
 #ifdef GC
-        cfg_gc_enabled = true;
-        return 0;
+	panic("GC support is currently broken");
+	cfg_gc_enabled = true;
+	return 0;
 #else
-        log_err("cfg: cannot enable GC, "
-                "please recompile with GC support");
-        return -EINVAL;
+	log_err("cfg: cannot enable GC, please recompile with GC support");
+	return -EINVAL;
 #endif
 }
 
@@ -322,19 +339,22 @@ static int parse_enable_gc(const char *name, const char *val)
  * Parsing Infrastructure
  */
 
-typedef int (*cfg_fn_t)(const char *name, const char *val);
 
-struct cfg_handler {
-	const char	*name;
-	cfg_fn_t	fn;
-	bool		required;
-};
+static LIST_HEAD(dyn_cfg_handlers);
+static unsigned int nr_dyn_cfg_handlers;
+
+void cfg_register(struct cfg_handler *h)
+{
+	list_add_tail(&dyn_cfg_handlers, &h->link);
+	nr_dyn_cfg_handlers++;
+}
 
 static const struct cfg_handler cfg_handlers[] = {
 	{ "host_addr", parse_host_ip, true },
 	{ "host_netmask", parse_host_ip, true },
 	{ "host_gateway", parse_host_ip, true },
 	{ "host_mac", parse_mac_address, false },
+	{ "host_mtu", parse_mtu, false },
 	{ "runtime_kthreads", parse_runtime_kthreads, true },
 	{ "runtime_spinning_kthreads", parse_runtime_spinning_kthreads, false },
 	{ "runtime_guaranteed_kthreads", parse_runtime_guaranteed_kthreads,
@@ -362,12 +382,15 @@ int cfg_load(const char *path)
 {
 	FILE *f;
 	char buf[BUFSIZ];
-	DEFINE_BITMAP(parsed, ARRAY_SIZE(cfg_handlers));
+	size_t handler_cnt = ARRAY_SIZE(cfg_handlers) + nr_dyn_cfg_handlers;
+	DEFINE_BITMAP(parsed, handler_cnt);
 	char *name, *val;
 	int i, ret = 0, line = 0;
 	size_t len;
+	struct list_node *cur;
+	const struct cfg_handler *h;
 
-	bitmap_init(parsed, ARRAY_SIZE(cfg_handlers), 0);
+	bitmap_init(parsed, handler_cnt, 0);
 
 	log_info("loading configuration from '%s'", path);
 
@@ -390,8 +413,14 @@ int cfg_load(const char *path)
 		if (val[len - 1] == '\n')
 			val[len - 1] = '\0';
 
-		for (i = 0; i < ARRAY_SIZE(cfg_handlers); i++) {
-			const struct cfg_handler *h = &cfg_handlers[i];
+		cur = dyn_cfg_handlers.n.next;
+		for (i = 0; i < handler_cnt; i++) {
+			if (i < ARRAY_SIZE(cfg_handlers)) {
+				h = &cfg_handlers[i];
+			} else {
+				h = list_entry(cur, struct cfg_handler, link);
+				cur = cur->next;
+			}
 			if (!strncmp(name, h->name, BUFSIZ)) {
 				ret = h->fn(name, val);
 				if (ret) {
@@ -407,8 +436,14 @@ int cfg_load(const char *path)
 		line++;
 	}
 
-	for (i = 0; i < ARRAY_SIZE(cfg_handlers); i++) {
-		const struct cfg_handler *h = &cfg_handlers[i];
+	cur = dyn_cfg_handlers.n.next;
+	for (i = 0; i < handler_cnt; i++) {
+		if (i < ARRAY_SIZE(cfg_handlers)) {
+			h = &cfg_handlers[i];
+		} else {
+			h = list_entry(cur, struct cfg_handler, link);
+			cur = cur->next;
+		}
 		if (h->required && !bitmap_test(parsed, i)) {
 			log_err("missing required config option '%s'", h->name);
 			ret = -EINVAL;
@@ -423,6 +458,26 @@ int cfg_load(const char *path)
 		ret = -EINVAL;
 		goto out;
 	}
+
+	/* log some relevant config parameters */
+	log_info("cfg: provisioned %d cores "
+		 "(%d guaranteed, %d burstable, %d spinning)",
+		 maxks, guaranteedks, maxks - guaranteedks, spinks);
+	log_info("cfg: task is %s",
+		 cfg_prio_is_lc ? "latency critical (LC)" : "best effort (BE)");
+	log_info("cfg: THRESH_QD: %ld, THRESH_HT: %ld",
+		 cfg_qdelay_us, cfg_ht_punish_us);
+	log_info("cfg: storage %s, directpath %s",
+#ifdef DIRECT_STORAGE
+		 cfg_storage_enabled ? "enabled" : "disabled",
+#else
+		"disabled",
+#endif
+#ifdef DIRECTPATH
+		 cfg_directpath_enabled ? "enabled" : "disabled");
+#else
+		"disabled");
+#endif
 
 out:
 	fclose(f);

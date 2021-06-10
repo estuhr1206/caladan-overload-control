@@ -39,6 +39,7 @@ static const struct init_entry global_init_handlers[] = {
 
 	/* network stack */
 	GLOBAL_INITIALIZER(net),
+	GLOBAL_INITIALIZER(udp),
 	GLOBAL_INITIALIZER(directpath),
 	GLOBAL_INITIALIZER(arp),
 	GLOBAL_INITIALIZER(trans),
@@ -60,8 +61,8 @@ static const struct init_entry thread_init_handlers[] = {
 	THREAD_INITIALIZER(kthread),
 	THREAD_INITIALIZER(ioqueues),
 	THREAD_INITIALIZER(stack),
-	THREAD_INITIALIZER(timer),
 	THREAD_INITIALIZER(sched),
+	THREAD_INITIALIZER(timer),
 	THREAD_INITIALIZER(smalloc),
 
 	/* network stack */

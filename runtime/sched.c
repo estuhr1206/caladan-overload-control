@@ -59,7 +59,6 @@ void set_uthread_specific(uint64_t val)
 	__self->tlsvar = val;
 }
 
-
 /**
  * cores_have_affinity - returns true if two cores have cache affinity
  * @cpua: the first core
@@ -81,15 +80,16 @@ static inline bool cores_have_affinity(unsigned int cpua, unsigned int cpub)
 static __noreturn void jmp_thread(thread_t *th)
 {
 	assert_preempt_disabled();
-	assert(th->state == THREAD_STATE_RUNNABLE);
+	assert(th->thread_ready);
 
 	__self = th;
-	th->state = THREAD_STATE_RUNNING;
-	if (unlikely(load_acquire(&th->stack_busy))) {
+	th->thread_ready = false;
+	if (unlikely(load_acquire(&th->thread_running))) {
 		/* wait until the scheduler finishes switching stacks */
-		while (load_acquire(&th->stack_busy))
+		while (load_acquire(&th->thread_running))
 			cpu_relax();
 	}
+	th->thread_running = true;
 	__jmp_thread(&th->tf);
 }
 
@@ -104,16 +104,17 @@ static __noreturn void jmp_thread(thread_t *th)
 static void jmp_thread_direct(thread_t *oldth, thread_t *newth)
 {
 	assert_preempt_disabled();
-	assert(newth->state == THREAD_STATE_RUNNABLE);
+	assert(newth->thread_ready);
 
 	__self = newth;
-	newth->state = THREAD_STATE_RUNNING;
-	if (unlikely(load_acquire(&newth->stack_busy))) {
+	newth->thread_ready = false;
+	if (unlikely(load_acquire(&newth->thread_running))) {
 		/* wait until the scheduler finishes switching stacks */
-		while (load_acquire(&newth->stack_busy))
+		while (load_acquire(&newth->thread_running))
 			cpu_relax();
 	}
-	__jmp_thread_direct(&oldth->tf, &newth->tf, &oldth->stack_busy);
+	newth->thread_running = true;
+	__jmp_thread_direct(&oldth->tf, &newth->tf, &oldth->thread_running);
 }
 
 /**
@@ -164,12 +165,14 @@ static void drain_overflow(struct kthread *l)
 static bool work_available(struct kthread *k)
 {
 #ifdef GC
-	if (get_gc_gen() != ACCESS_ONCE(k->local_gc_gen) && ACCESS_ONCE(k->parked))
+	if (get_gc_gen() != ACCESS_ONCE(k->local_gc_gen) &&
+	    ACCESS_ONCE(k->parked)) {
 		return true;
+	}
 #endif
 
 	return ACCESS_ONCE(k->rq_tail) != ACCESS_ONCE(k->rq_head) ||
-	        !list_empty_volatile(&k->rq_overflow) || softirq_work_available(k);
+	       softirq_pending(k);
 }
 
 static void update_oldest_tsc(struct kthread *k)
@@ -219,8 +222,8 @@ static bool steal_work(struct kthread *l, struct kthread *r)
 		store_release(&r->rq_tail, rq_tail);
 
 		/*
-		 * Drain the remote overflow queue, so newly readied tasks don't cut
-		 * in front tasks in the oveflow queue
+		 * Drain the remote overflow queue, so newly readied tasks
+		 * don't cut in front tasks in the oveflow queue
 		 */
 		while (true) {
 			th = list_pop(&r->rq_overflow, thread_t, link);
@@ -247,43 +250,35 @@ static bool steal_work(struct kthread *l, struct kthread *r)
 	if (th) {
 		ACCESS_ONCE(r->q_ptrs->rq_tail)++;
 		update_oldest_tsc(r);
-		goto done;
-	}
-
-	/* check for softirqs */
-	th = softirq_run_thread(r, RUNTIME_SOFTIRQ_REMOTE_BUDGET);
-	if (th) {
-		STAT(SOFTIRQS_STOLEN)++;
-		goto done;
-	}
-
-done:
-	spin_unlock(&r->lock);
-
-	if (th) {
+		spin_unlock(&r->lock);
 		l->rq[l->rq_head++ % RUNTIME_RQ_SIZE] = th;
 		ACCESS_ONCE(l->q_ptrs->oldest_tsc) = th->ready_tsc;
 		ACCESS_ONCE(l->q_ptrs->rq_head)++;
 		STAT(THREADS_STOLEN)++;
+		return true;
 	}
 
-	return th != NULL;
+	/* check for softirqs */
+	if (softirq_sched(r)) {
+		STAT(SOFTIRQS_STOLEN)++;
+		spin_unlock(&r->lock);
+		return true;
+	}
+
+	spin_unlock(&r->lock);
+	return false;
 }
 
-static __noinline struct thread *do_watchdog(struct kthread *l)
+static __noinline bool do_watchdog(struct kthread *l)
 {
-	thread_t *th;
+	bool work;
 
 	assert_spin_lock_held(&l->lock);
 
-	/* then check the network queues */
-	th = softirq_run_thread(l, RUNTIME_SOFTIRQ_LOCAL_BUDGET);
-	if (th) {
+	work = softirq_sched(l);
+	if (work)
 		STAT(SOFTIRQS_LOCAL)++;
-		return th;
-	}
-
-	return NULL;
+	return work;
 }
 
 /* the main scheduler routine, decides what to run next */
@@ -300,8 +295,8 @@ static __noreturn __noinline void schedule(void)
 	assert(l->parked == false);
 
 	/* unmark busy for the stack of the last uthread */
-	if (__self != NULL) {
-		store_release(&__self->stack_busy, false);
+	if (likely(__self != NULL)) {
+		store_release(&__self->thread_running, false);
 		__self = NULL;
 	}
 
@@ -331,8 +326,7 @@ static __noreturn __noinline void schedule(void)
 	    unlikely(start_tsc - last_watchdog_tsc >=
 	             cycles_per_us * RUNTIME_WATCHDOG_US)) {
 		last_watchdog_tsc = start_tsc;
-		th = do_watchdog(l);
-		if (th)
+		if (do_watchdog(l))
 			goto done;
 	}
 
@@ -349,8 +343,7 @@ static __noreturn __noinline void schedule(void)
 
 again:
 	/* then check for local softirqs */
-	th = softirq_run_thread(l, RUNTIME_SOFTIRQ_LOCAL_BUDGET);
-	if (th) {
+	if (softirq_sched(l)) {
 		STAT(SOFTIRQS_LOCAL)++;
 		goto done;
 	}
@@ -370,8 +363,7 @@ again:
 	}
 
 	/* recheck for local softirqs one last time */
-	th = softirq_run_thread(l, RUNTIME_SOFTIRQ_LOCAL_BUDGET);
-	if (th) {
+	if (softirq_sched(l)) {
 		STAT(SOFTIRQS_LOCAL)++;
 		goto done;
 	}
@@ -385,8 +377,9 @@ again:
 	if (!preempt_cede_needed() &&
 	    (++iters < RUNTIME_SCHED_POLL_ITERS ||
 	     rdtsc() - start_tsc < cycles_per_us * RUNTIME_SCHED_MIN_POLL_US ||
-	     softirq_work_soon(l, start_tsc)))
+	     storage_pending_completions(&l->storage_q))) {
 		goto again;
+	}
 
 	l->parked = true;
 	spin_unlock(&l->lock);
@@ -404,11 +397,9 @@ again:
 
 done:
 	/* pop off a thread and run it */
-	if (!th) {
-		assert(l->rq_head != l->rq_tail);
-		th = l->rq[l->rq_tail++ % RUNTIME_RQ_SIZE];
-		ACCESS_ONCE(l->q_ptrs->rq_tail)++;
-	}
+	assert(l->rq_head != l->rq_tail);
+	th = l->rq[l->rq_tail++ % RUNTIME_RQ_SIZE];
+	ACCESS_ONCE(l->q_ptrs->rq_tail)++;
 
 	/* move overflow tasks into the runqueue */
 	if (unlikely(!list_empty(&l->rq_overflow)))
@@ -439,16 +430,17 @@ done:
 	jmp_thread(th);
 }
 
-static __always_inline void enter_schedule(thread_t *myth)
+static __always_inline void enter_schedule(thread_t *curth)
 {
 	struct kthread *k = myk();
 	thread_t *th;
 	uint64_t now;
 
-	/* voluntarily yielding clears this thread's start time */
-	myth->run_start_tsc = UINT64_MAX;
-
 	assert_preempt_disabled();
+
+	/* prepare current thread for sleeping */
+	curth->run_start_tsc = UINT64_MAX;
+	curth->last_cpu = k->curr_cpu;
 
 	spin_lock(&k->lock);
 	now = rdtsc();
@@ -472,6 +464,11 @@ static __always_inline void enter_schedule(thread_t *myth)
 	/* pop the next runnable thread from the queue */
 	th = k->rq[k->rq_tail++ % RUNTIME_RQ_SIZE];
 	ACCESS_ONCE(k->q_ptrs->rq_tail)++;
+
+	/* move overflow tasks into the runqueue */
+	if (unlikely(!list_empty(&k->rq_overflow)))
+		drain_overflow(k);
+
 	update_oldest_tsc(k);
 	spin_unlock(&k->lock);
 
@@ -488,9 +485,8 @@ static __always_inline void enter_schedule(thread_t *myth)
 	BUG_ON((preempt_cnt & ~PREEMPT_NOT_PENDING) != 1);
 
 	/* check if we're switching into the same thread as before */
-	if (unlikely(th == myth)) {
-		th->state = THREAD_STATE_RUNNING;
-		th->stack_busy = false;
+	if (unlikely(th == curth)) {
+		th->thread_ready = false;
 		preempt_enable();
 		return;
 	}
@@ -501,75 +497,143 @@ static __always_inline void enter_schedule(thread_t *myth)
 		STAT(LOCAL_RUNS)++;
 	else
 		STAT(REMOTE_RUNS)++;
-	jmp_thread_direct(myth, th);
+	jmp_thread_direct(curth, th);
 }
 
 /**
  * thread_park_and_unlock_np - puts a thread to sleep, unlocks the lock @l,
- * and schedules the next thread
+ *                             and schedules the next thread
  * @l: the lock to be released
  */
 void thread_park_and_unlock_np(spinlock_t *l)
 {
-	thread_t *myth = thread_self();
+	thread_t *curth = thread_self();
 
 	assert_preempt_disabled();
 	assert_spin_lock_held(l);
-	assert(myth->state == THREAD_STATE_RUNNING);
-
-	myth->state = THREAD_STATE_SLEEPING;
-	myth->stack_busy = true;
-	myth->last_cpu = myk()->curr_cpu;
 	spin_unlock(l);
+	enter_schedule(curth);
+}
 
-	enter_schedule(myth);
+/**
+ * thread_park_and_preempt_enable - puts a thread to sleep, enables preemption,
+ *                                  and schedules the next thread
+ */
+void thread_park_and_preempt_enable(void)
+{
+	thread_t *curth = thread_self();
+
+	assert_preempt_disabled();
+	enter_schedule(curth);
 }
 
 /**
  * thread_yield - yields the currently running thread
  *
- * Yielding will give other threads a chance to run.
+ * Yielding will give other threads and softirqs a chance to run.
  */
 void thread_yield(void)
 {
-	struct kthread *k;
-	thread_t *myth = thread_self();
+	thread_t *curth = thread_self();
 
 	/* check for softirqs */
-	softirq_run(RUNTIME_SOFTIRQ_LOCAL_BUDGET);
+	softirq_run();
 
-	k = getk();
+	preempt_disable();
+	curth->thread_ready = false;
+	thread_ready(curth);
+	enter_schedule(curth);
+}
 
-	assert(myth->state == THREAD_STATE_RUNNING);
-	myth->state = THREAD_STATE_SLEEPING;
-	myth->last_cpu = k->curr_cpu;
-	store_release(&myth->stack_busy, true);
-	thread_ready(myth);
+static void thread_ready_prepare(struct kthread *k, thread_t *th)
+{
+	/* check for misuse where a ready thread is marked ready again */
+	BUG_ON(th->thread_ready);
 
-	enter_schedule(myth);
+	/* prepare thread to be runnable */
+	th->thread_ready = true;
+	th->ready_tsc = rdtsc();
+	if (cores_have_affinity(th->last_cpu, k->curr_cpu))
+		STAT(LOCAL_WAKES)++;
+	else
+		STAT(REMOTE_WAKES)++;
 }
 
 /**
- * thread_ready - marks a uthread as a runnable
+ * thread_ready_locked - makes a uthread runnable (at tail, kthread lock held)
  * @th: the thread to mark runnable
  *
- * This function can only be called when @th is sleeping.
+ * This function can only be called when @th is parked.
+ * This function must be called with preemption disabled and the kthread lock
+ * held.
+ */
+void thread_ready_locked(thread_t *th)
+{
+	struct kthread *k = myk();
+
+	assert_preempt_disabled();
+	assert_spin_lock_held(&k->lock);
+
+	thread_ready_prepare(k, th);
+	if (unlikely(k->rq_head - k->rq_tail >= RUNTIME_RQ_SIZE)) {
+		assert(k->rq_head - k->rq_tail == RUNTIME_RQ_SIZE);
+		list_add_tail(&k->rq_overflow, &th->link);
+		ACCESS_ONCE(k->q_ptrs->rq_head)++;
+		STAT(RQ_OVERFLOW)++;
+		return;
+	}
+
+	k->rq[k->rq_head++ % RUNTIME_RQ_SIZE] = th;
+	if (k->rq_head - k->rq_tail == 1)
+		ACCESS_ONCE(k->q_ptrs->oldest_tsc) = th->ready_tsc;
+	ACCESS_ONCE(k->q_ptrs->rq_head)++;
+}
+
+/**
+ * thread_ready_head_locked - makes a uthread runnable (at head, kthread lock held)
+ * @th: the thread to mark runnable
+ *
+ * This function can only be called when @th is parked.
+ * This function must be called with preemption disabled and the kthread lock
+ * held.
+ */
+void thread_ready_head_locked(thread_t *th)
+{
+	struct kthread *k = myk();
+	thread_t *oldestth;
+
+	assert_preempt_disabled();
+	assert_spin_lock_held(&k->lock);
+
+	thread_ready_prepare(k, th);
+
+	if (k->rq_head != k->rq_tail)
+		th->ready_tsc = k->rq[k->rq_tail % RUNTIME_RQ_SIZE]->ready_tsc;
+	oldestth = k->rq[--k->rq_tail % RUNTIME_RQ_SIZE];
+	k->rq[k->rq_tail % RUNTIME_RQ_SIZE] = th;
+	if (unlikely(k->rq_head - k->rq_tail > RUNTIME_RQ_SIZE)) {
+		list_add(&k->rq_overflow, &oldestth->link);
+		k->rq_head--;
+		STAT(RQ_OVERFLOW)++;
+	}
+	ACCESS_ONCE(k->q_ptrs->oldest_tsc) = th->ready_tsc;
+	ACCESS_ONCE(k->q_ptrs->rq_head)++;
+}
+
+/**
+ * thread_ready - makes a uthread runnable (at the tail of the queue)
+ * @th: the thread to mark runnable
+ *
+ * This function can only be called when @th is parked.
  */
 void thread_ready(thread_t *th)
 {
 	struct kthread *k;
 	uint32_t rq_tail;
 
-	assert(th->state == THREAD_STATE_SLEEPING);
-	th->state = THREAD_STATE_RUNNABLE;
-
 	k = getk();
-	if (cores_have_affinity(th->last_cpu, k->curr_cpu))
-		STAT(LOCAL_WAKES)++;
-	else
-		STAT(REMOTE_WAKES)++;
+	thread_ready_prepare(k, th);
 	rq_tail = load_acquire(&k->rq_tail);
-	th->ready_tsc = rdtsc();
 	if (unlikely(k->rq_head - rq_tail >= RUNTIME_RQ_SIZE)) {
 		assert(k->rq_head - rq_tail == RUNTIME_RQ_SIZE);
 		spin_lock(&k->lock);
@@ -583,11 +647,38 @@ void thread_ready(thread_t *th)
 
 	k->rq[k->rq_head % RUNTIME_RQ_SIZE] = th;
 	store_release(&k->rq_head, k->rq_head + 1);
-
-	if (load_acquire(&k->rq_tail) == k->rq_head - 1)
+	if (k->rq_head - load_acquire(&k->rq_tail) == 1)
 		ACCESS_ONCE(k->q_ptrs->oldest_tsc) = th->ready_tsc;
 	ACCESS_ONCE(k->q_ptrs->rq_head)++;
+	putk();
+}
 
+/**
+ * thread_ready_head - makes a uthread runnable (at the head of the queue)
+ * @th: the thread to mark runnable
+ *
+ * This function can only be called when @th is parked.
+ */
+void thread_ready_head(thread_t *th)
+{
+	struct kthread *k;
+	thread_t *oldestth;
+
+	k = getk();
+	thread_ready_prepare(k, th);
+	spin_lock(&k->lock);
+	if (k->rq_head != k->rq_tail)
+		th->ready_tsc = k->rq[k->rq_tail % RUNTIME_RQ_SIZE]->ready_tsc;
+	oldestth = k->rq[--k->rq_tail % RUNTIME_RQ_SIZE];
+	k->rq[k->rq_tail % RUNTIME_RQ_SIZE] = th;
+	if (unlikely(k->rq_head - k->rq_tail > RUNTIME_RQ_SIZE)) {
+		list_add(&k->rq_overflow, &oldestth->link);
+		k->rq_head--;
+		STAT(RQ_OVERFLOW)++;
+	}
+	spin_unlock(&k->lock);
+	ACCESS_ONCE(k->q_ptrs->oldest_tsc) = th->ready_tsc;
+	ACCESS_ONCE(k->q_ptrs->rq_head)++;
 	putk();
 }
 
@@ -596,8 +687,8 @@ static void thread_finish_cede(void)
 	struct kthread *k = myk();
 	thread_t *th, *myth = thread_self();
 
-	assert(myth->state == THREAD_STATE_RUNNING);
-	myth->state = THREAD_STATE_RUNNABLE;
+	myth->thread_running = false;
+	myth->thread_ready = true;
 	myth->last_cpu = k->curr_cpu;
 	__self = NULL;
 
@@ -618,6 +709,7 @@ static void thread_finish_cede(void)
 	if (unlikely(k->rq_head - k->rq_tail > RUNTIME_RQ_SIZE)) {
 		list_add(&k->rq_overflow, &th->link);
 		k->rq_head--;
+		STAT(RQ_OVERFLOW)++;
 	}
 	spin_unlock(&k->lock);
 
@@ -670,12 +762,13 @@ static __always_inline thread_t *__thread_create(void)
 		preempt_enable();
 		return NULL;
 	}
+	th->last_cpu = myk()->curr_cpu;
 	preempt_enable();
 
 	th->stack = s;
-	th->state = THREAD_STATE_SLEEPING;
 	th->main_thread = false;
-	th->last_cpu = myk()->curr_cpu;
+	th->thread_ready = false;
+	th->thread_running = false;
 	th->run_start_tsc = UINT64_MAX;
 
 	return th;
@@ -698,7 +791,6 @@ thread_t *thread_create(thread_fn_t fn, void *arg)
 	th->tf.rdi = (uint64_t)arg;
 	th->tf.rbp = (uint64_t)0; /* just in case base pointers are enabled */
 	th->tf.rip = (uint64_t)fn;
-	th->stack_busy = false;
 	gc_register_thread(th);
 	return th;
 }
@@ -724,7 +816,6 @@ thread_t *thread_create_with_buf(thread_fn_t fn, void **buf, size_t buf_len)
 	th->tf.rdi = (uint64_t)ptr;
 	th->tf.rbp = (uint64_t)0; /* just in case base pointers are enabled */
 	th->tf.rip = (uint64_t)fn;
-	th->stack_busy = false;
 	*buf = ptr;
 	gc_register_thread(th);
 	return th;
@@ -767,7 +858,6 @@ int thread_spawn_main(thread_fn_t fn, void *arg)
 	if (!th)
 		return -ENOMEM;
 	th->main_thread = true;
-	th->last_cpu = sched_getcpu();
 	thread_ready(th);
 	return 0;
 }

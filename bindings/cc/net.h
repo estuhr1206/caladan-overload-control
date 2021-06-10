@@ -4,15 +4,15 @@
 
 extern "C" {
 #include <base/stddef.h>
-#include <runtime/udp.h>
 #include <runtime/tcp.h>
+#include <runtime/udp.h>
 }
 
 namespace rt {
 
 class NetConn {
  public:
-  virtual ~NetConn() {};
+  virtual ~NetConn(){};
   virtual ssize_t Read(void *buf, size_t len) = 0;
   virtual ssize_t Write(const void *buf, size_t len) = 0;
 };
@@ -20,10 +20,10 @@ class NetConn {
 // UDP Connections.
 class UdpConn : public NetConn {
  public:
-  // The maximum size of a UDP packet.
-  static constexpr size_t kMaxPayloadSize = UDP_MAX_PAYLOAD;
-
   ~UdpConn() { udp_close(c_); }
+
+  // The maximum possible payload size (with the maximum MTU).
+  static constexpr size_t kMaxPayloadSize = UDP_MAX_PAYLOAD_SIZE;
 
   // Creates a UDP connection between a local and remote address.
   static UdpConn *Dial(netaddr laddr, netaddr raddr) {
@@ -39,6 +39,11 @@ class UdpConn : public NetConn {
     int ret = udp_listen(laddr, &c);
     if (ret) return nullptr;
     return new UdpConn(c);
+  }
+
+  // Gets the MTU-limited payload size.
+  static size_t PayloadSize() {
+    return static_cast<size_t>(udp_payload_size);
   }
 
   // Gets the local UDP address.
@@ -62,22 +67,16 @@ class UdpConn : public NetConn {
   }
 
   // Reads a datagram.
-  ssize_t Read(void *buf, size_t len) {
-    return udp_read(c_, buf, len);
-  }
+  ssize_t Read(void *buf, size_t len) { return udp_read(c_, buf, len); }
 
   // Writes a datagram.
-  ssize_t Write(const void *buf, size_t len) {
-    return udp_write(c_, buf, len);
-  }
+  ssize_t Write(const void *buf, size_t len) { return udp_write(c_, buf, len); }
 
   // Shutdown the socket (no more receives).
-  void Shutdown() {
-    udp_shutdown(c_);
-  }
+  void Shutdown() { udp_shutdown(c_); }
 
  private:
-  UdpConn(udpconn_t *c) : c_(c) { }
+  UdpConn(udpconn_t *c) : c_(c) {}
 
   // disable move and copy.
   UdpConn(const UdpConn&) = delete;
@@ -93,14 +92,6 @@ class TcpConn : public NetConn {
  public:
   ~TcpConn() { tcp_close(c_); }
 
-  // Creates a TCP connection with a given affinity
-  static TcpConn *DialAffinity(uint32_t affinity, netaddr raddr) {
-    tcpconn_t *c;
-    int ret = tcp_dial_affinity(affinity, raddr, &c);
-    if (ret) return nullptr;
-    return new TcpConn(c);
-  }
-
   // Creates a TCP connection between a local and remote address.
   static TcpConn *Dial(netaddr laddr, netaddr raddr) {
     tcpconn_t *c;
@@ -109,10 +100,18 @@ class TcpConn : public NetConn {
     return new TcpConn(c);
   }
 
-  // Creates a new TCP connection with matching affinity
-  TcpConn *DialAffinity(netaddr raddr) {
+  // Creates a TCP connection with affinity to a CPU index.
+  static TcpConn *DialAffinity(unsigned int cpu, netaddr raddr) {
     tcpconn_t *c;
-    int ret = tcp_dial_conn_affinity(c_, raddr, &c);
+    int ret = tcp_dial_affinity(cpu, raddr, &c);
+    if (ret) return nullptr;
+    return new TcpConn(c);
+  }
+
+  // Creates a new TCP connection with affinity to another TCP connection.
+  static TcpConn *DialAffinity(TcpConn *cin, netaddr raddr) {
+    tcpconn_t *c;
+    int ret = tcp_dial_conn_affinity(cin->c_, raddr, &c);
     if (ret) return nullptr;
     return new TcpConn(c);
   }
@@ -123,13 +122,9 @@ class TcpConn : public NetConn {
   netaddr RemoteAddr() const { return tcp_remote_addr(c_); }
 
   // Reads from the TCP stream.
-  ssize_t Read(void *buf, size_t len) {
-    return tcp_read(c_, buf, len);
-  };
+  ssize_t Read(void *buf, size_t len) { return tcp_read(c_, buf, len); };
   // Writes to the TCP stream.
-  ssize_t Write(const void *buf, size_t len) {
-    return tcp_write(c_, buf, len);
-  }
+  ssize_t Write(const void *buf, size_t len) { return tcp_write(c_, buf, len); }
   // Reads a vector from the TCP stream.
   ssize_t Readv(const iovec *iov, int iovcnt) {
     return tcp_readv(c_, iov, iovcnt);
@@ -141,7 +136,7 @@ class TcpConn : public NetConn {
 
   // Reads exactly @len bytes from the TCP stream.
   ssize_t ReadFull(void *buf, size_t len) {
-    char *pos = reinterpret_cast<char*>(buf);
+    char *pos = reinterpret_cast<char *>(buf);
     size_t n = 0;
     while (n < len) {
       ssize_t ret = Read(pos + n, len - n);
@@ -154,17 +149,32 @@ class TcpConn : public NetConn {
 
   // Writes exactly @len bytes to the TCP stream.
   ssize_t WriteFull(const void *buf, size_t len) {
-    const char *pos = reinterpret_cast<const char*>(buf);
+    const char *pos = reinterpret_cast<const char *>(buf);
     size_t n = 0;
     while (n < len) {
       ssize_t ret = Write(pos + n, len - n);
       if (ret < 0) return ret;
-      BUG_ON(ret == 0);
       assert(ret > 0);
       n += ret;
     }
     assert(n == len);
     return n;
+  }
+
+  // Reads exactly a vector of bytes from the TCP stream.
+  ssize_t ReadvFull(const iovec *iov, int iovcnt) {
+    if (__builtin_constant_p(iovcnt)) {
+      if (iovcnt == 1) return ReadFull(iov[0].iov_base, iov[0].iov_len);
+    }
+    return ReadvFullRaw(iov, iovcnt);
+  }
+
+  // Writes exactly a vector of bytes to the TCP stream.
+  ssize_t WritevFull(const iovec *iov, int iovcnt) {
+    if (__builtin_constant_p(iovcnt)) {
+      if (iovcnt == 1) return WriteFull(iov[0].iov_base, iov[0].iov_len);
+    }
+    return WritevFullRaw(iov, iovcnt);
   }
 
   // Gracefully shutdown the TCP connection.
@@ -173,11 +183,14 @@ class TcpConn : public NetConn {
   void Abort() { tcp_abort(c_); }
 
  private:
-  TcpConn(tcpconn_t *c) : c_(c) { }
+  TcpConn(tcpconn_t *c) : c_(c) {}
 
   // disable move and copy.
   TcpConn(const TcpConn&) = delete;
   TcpConn& operator=(const TcpConn&) = delete;
+
+  ssize_t WritevFullRaw(const iovec *iov, int iovcnt);
+  ssize_t ReadvFullRaw(const iovec *iov, int iovcnt);
 
   tcpconn_t *c_;
 };
@@ -207,7 +220,7 @@ class TcpQueue {
   void Shutdown() { tcp_qshutdown(q_); }
 
  private:
-  TcpQueue(tcpqueue_t *q) : q_(q) { }
+  TcpQueue(tcpqueue_t *q) : q_(q) {}
 
   // disable move and copy.
   TcpQueue(const TcpQueue&) = delete;
@@ -216,4 +229,4 @@ class TcpQueue {
   tcpqueue_t *q_;
 };
 
-} // namespace rt
+}  // namespace rt

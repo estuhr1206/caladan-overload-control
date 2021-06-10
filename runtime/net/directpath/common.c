@@ -2,7 +2,7 @@
 #include <base/kref.h>
 #include <base/mempool.h>
 #include <runtime/sync.h>
-
+#include <base/log.h>
 #include "defs.h"
 
 #ifdef DIRECTPATH
@@ -10,16 +10,41 @@
 static struct hardware_q *rxq_out[NCPU];
 static struct direct_txq *txq_out[NCPU];
 
+/* configuration options */
+struct pci_addr nic_pci_addr;
+bool cfg_pci_addr_specified;
+bool cfg_directpath_enabled;
+
 struct mempool directpath_buf_mp;
 struct tcache *directpath_buf_tcache;
 DEFINE_PERTHREAD(struct tcache_perthread, directpath_buf_pt);
 
-bool cfg_directpath_enabled;
+static int parse_directpath_pci(const char *name, const char *val)
+{
+	int ret;
+
+	ret = pci_str_to_addr(val, &nic_pci_addr);
+	if (ret)
+		return ret;
+
+	log_info("directpath: specified pci address %s", val);
+	cfg_pci_addr_specified = true;
+	return 0;
+}
+
+static struct cfg_handler directpath_pci_handler = {
+	.name = "directpath_pci",
+	.fn = parse_directpath_pci,
+	.required = false,
+};
+
+REGISTER_CFG(directpath_pci_handler);
 
 size_t directpath_rx_buf_pool_sz(unsigned int nrqs)
 {
-	return align_up(MAX(8, guaranteedks) * (16 * RQ_NUM_DESC) * 16UL * MBUF_DEFAULT_LEN,
-			PGSIZE_2MB);
+	size_t buflen = MBUF_DEFAULT_LEN;
+	buflen *= MAX(8, guaranteedks) * (16 * RQ_NUM_DESC) * 2UL;
+	return align_up(buflen, PGSIZE_2MB);
 }
 
 void directpath_rx_completion(struct mbuf *m)
@@ -40,8 +65,8 @@ static int rx_memory_init(void)
 	if (rx_buf == MAP_FAILED)
 		return -ENOMEM;
 
-	ret = mempool_create(&directpath_buf_mp, rx_buf, rx_len,
-			     PGSIZE_2MB, MBUF_DEFAULT_LEN);
+	ret = mempool_create(&directpath_buf_mp, rx_buf, rx_len, PGSIZE_2MB,
+			     directpath_get_buf_size());
 	if (ret)
 		return ret;
 
@@ -51,7 +76,27 @@ static int rx_memory_init(void)
 		return -ENOMEM;
 
 	return 0;
+}
 
+static void directpath_softirq_one(struct kthread *k)
+{
+	struct mbuf *ms[RUNTIME_RX_BATCH_SIZE];
+	int cnt;
+
+	cnt = net_ops.rx_batch(k->directpath_rxq, ms, RUNTIME_RX_BATCH_SIZE);
+	net_rx_batch(ms, cnt);
+}
+
+static void directpath_softirq(void *arg)
+{
+	struct kthread *k = arg;
+
+	while (true) {
+		directpath_softirq_one(k);
+		preempt_disable();
+		k->directpath_busy = false;
+		thread_park_and_preempt_enable();
+	}
 }
 
 int directpath_init(void)
@@ -76,13 +121,19 @@ int directpath_init(void)
 
 int directpath_init_thread(void)
 {
-	if (!cfg_directpath_enabled)
-		return 0;
-
 	struct kthread *k = myk();
 	struct hardware_queue_spec *hs;
 	struct hardware_q *rxq = rxq_out[k->kthread_idx];
+	thread_t *th;
 
+	if (!cfg_directpath_enabled)
+		return 0;
+
+	th = thread_create(directpath_softirq, k);
+	if (!th)
+		return -ENOMEM;
+
+	k->directpath_softirq = th;
 	rxq->shadow_tail = &k->q_ptrs->directpath_rx_tail;
 	hs = &iok.threads[k->kthread_idx].direct_rxq;
 

@@ -23,14 +23,11 @@ struct iovec;
 
 #include "defs.h"
 
+unsigned long storage_device_latency_us = 100;
 bool cfg_storage_enabled;
-unsigned long device_latency_us = 10;
 
 static struct spdk_nvme_ctrlr *controller;
 static struct spdk_nvme_ns *spdk_namespace;
-
-static __thread struct thread **cb_ths;
-static __thread unsigned int nrcb_ths;
 
 /* 4KB storage request buffers */
 #define REQUEST_BUF_POOL_SZ (PGSIZE_2MB * 20)
@@ -49,14 +46,10 @@ struct nvme_device {
 	}
 };
 
-/**
- * seq_complete - callback run after spdk nvme operation is complete
- *
- */
 static void seq_complete(void *arg, const struct spdk_nvme_cpl *completion)
 {
 	struct thread *th = arg;
-	cb_ths[nrcb_ths++] = th;
+	thread_ready(th);
 }
 
 /**
@@ -99,73 +92,170 @@ static void attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	for (i = 0; i < ARRAY_SIZE(known_devices); i++) {
 		if (!strncmp((char *)ctrlr_data->mn, known_devices[i].name,
 			           strlen(known_devices[i].name))) {
-			device_latency_us = known_devices[i].latency_us;
+			log_info("storage: recognized device %s", known_devices[i].name);
+			storage_device_latency_us = known_devices[i].latency_us;
 			break;
 		}
 	}
 
-	if (i == ARRAY_SIZE(known_devices))
-		log_err("Warning: could not find latency profile for device %s,"
-			      "using default latency of %lu us",
-			      ctrlr_data->mn, device_latency_us);
+
 }
 
-
 /**
- * storage_init - initializes storage
+ * storage_write - write a payload to the nvme device
+ *                 expects lba_count*storage_block_size() bytes to be allocated in the buffer
  *
+ * returns -ENOMEM if no available memory, and -EIO if the write operation failed
  */
-int storage_init(void)
+int storage_write(const void *payload, uint64_t lba, uint32_t lba_count)
 {
-	int shm_id, rc;
-	struct spdk_env_opts opts;
-	void *buf;
+	int rc;
+	struct kthread *k;
+	struct storage_q *q;
+	void *spdk_payload;
 
 	if (!cfg_storage_enabled)
-		return 0;
+		return -ENODEV;
 
-	spdk_env_opts_init(&opts);
-	opts.name = "shenango runtime";
-	shm_id = rand_crc32c((uintptr_t)myk());
-	if (shm_id < 0)
-		shm_id = -shm_id;
-	opts.shm_id = shm_id;
+	size_t req_size = lba_count * block_size;
+	bool use_thread_cache = req_size <= REQUEST_BUF_SZ;
 
-	if (spdk_env_init(&opts) < 0) {
-		log_err("Unable to initialize SPDK env");
-		return 1;
+	k = getk();
+	q = &k->storage_q;
+
+	if (likely(use_thread_cache)) {
+		spdk_payload = tcache_alloc(&perthread_get(storage_buf_pt));
+	} else {
+		spdk_payload =
+			spdk_zmalloc(req_size, 0, NULL, SPDK_ENV_SOCKET_ID_ANY,
+				     SPDK_MALLOC_DMA);
 	}
 
-	rc = spdk_nvme_probe(NULL, NULL, probe_cb, attach_cb, NULL);
-	if (rc != 0) {
-		log_err("spdk_nvme_probe() failed");
-		return 1;
-	}
-
-	if (controller == NULL) {
-		log_err("no NVMe controllers found");
-		return 1;
-	}
-
-	buf = mem_map_anom(NULL, REQUEST_BUF_POOL_SZ, PGSIZE_2MB, 0);
-	if (buf == MAP_FAILED)
+	if (unlikely(spdk_payload == NULL)) {
+		putk();
 		return -ENOMEM;
+	}
 
-	rc = spdk_mem_register(buf, REQUEST_BUF_POOL_SZ);
-	if (rc)
-		return rc;
+	memcpy(spdk_payload, payload, req_size);
 
-	rc = mempool_create(&storage_buf_mp, buf, REQUEST_BUF_POOL_SZ,
-			    PGSIZE_2MB, REQUEST_BUF_SZ);
-	if (rc)
-		return rc;
+	spin_lock(&q->lock);
+	rc = spdk_nvme_ns_cmd_write(spdk_namespace, q->spdk_qp_handle,
+				    spdk_payload, lba, lba_count, seq_complete,
+				    thread_self(), 0);
 
-	storage_buf_tcache = mempool_create_tcache(
-		&storage_buf_mp, "storagebufs", TCACHE_DEFAULT_MAG_SIZE);
-	if (!storage_buf_tcache)
+	if (unlikely(rc != 0)) {
+		spin_unlock(&q->lock);
+		rc = -EIO;
+		goto done_np;
+	}
+
+	q->outstanding_reqs++;
+	thread_park_and_unlock_np(&q->lock);
+
+	preempt_disable();
+
+done_np:
+	if (likely(use_thread_cache))
+		tcache_free(&perthread_get(storage_buf_pt), spdk_payload);
+	else
+		spdk_free(spdk_payload);
+
+	preempt_enable();
+
+	return rc;
+}
+
+/**
+ * storage_read - read a payload from the nvme device
+ *                expects lba_count*storage_block_size() bytes to be allocated in the buffer
+ *
+ * returns -ENOMEM if no available memory, and -EIO if the write operation failed
+ */
+int storage_read(void *dest, uint64_t lba, uint32_t lba_count)
+{
+	int rc;
+	struct kthread *k;
+	struct storage_q *q;
+	void *spdk_payload;
+
+	if (!cfg_storage_enabled)
+		return -ENODEV;
+
+	size_t req_size = lba_count * block_size;
+	bool use_thread_cache = req_size <= REQUEST_BUF_SZ;
+
+	k = getk();
+	q = &k->storage_q;
+
+	if (likely(use_thread_cache)) {
+		spdk_payload = tcache_alloc(&perthread_get(storage_buf_pt));
+	} else {
+		spdk_payload =
+			spdk_zmalloc(req_size, 0, NULL, SPDK_ENV_SOCKET_ID_ANY,
+				     SPDK_MALLOC_DMA);
+	}
+
+	if (unlikely(spdk_payload == NULL)) {
+		putk();
 		return -ENOMEM;
+	}
 
-	return 0;
+	spin_lock(&q->lock);
+	rc = spdk_nvme_ns_cmd_read(spdk_namespace, q->spdk_qp_handle,
+				   spdk_payload, lba, lba_count, seq_complete,
+				   thread_self(), 0);
+
+	if (unlikely(rc != 0)) {
+		spin_unlock(&q->lock);
+		rc = -EIO;
+		goto done_np;
+	}
+
+	q->outstanding_reqs++;
+	thread_park_and_unlock_np(&q->lock);
+	memcpy(dest, spdk_payload, req_size);
+	preempt_disable();
+
+done_np:
+	if (likely(use_thread_cache))
+		tcache_free(&perthread_get(storage_buf_pt), spdk_payload);
+	else
+		spdk_free(spdk_payload);
+	preempt_enable();
+
+	return rc;
+}
+
+static int storage_softirq_one(struct storage_q *q)
+{
+	int ret;
+
+	assert_spin_lock_held(&q->lock);
+
+	ret = spdk_nvme_qpair_process_completions(q->spdk_qp_handle, RUNTIME_RX_BATCH_SIZE);
+	q->outstanding_reqs -= ret;
+	return ret;
+}
+
+void storage_softirq(void *arg)
+{
+	struct kthread *k = arg;
+	struct storage_q *q = &k->storage_q;
+	int ret;
+
+	if (!cfg_storage_enabled)
+		return;
+
+	while (true) {
+		preempt_disable();
+		do {
+			spin_lock(&q->lock);
+			ret = storage_softirq_one(q);
+			spin_unlock(&q->lock);
+		} while (!preempt_needed() && ret > 0);
+		k->storage_busy = false;
+		thread_park_and_preempt_enable();
+	}
 }
 
 /**
@@ -176,6 +266,7 @@ int storage_init_thread(void)
 	struct kthread *k = myk();
 	struct hardware_queue_spec *hs = &iok.threads[k->kthread_idx].storage_hwq;
 	struct storage_q *q = &k->storage_q;
+	thread_t *th;
 
 	int ret;
 	uint32_t max_xfer_size, entries, depth, *consumer_idx;
@@ -187,6 +278,11 @@ int storage_init_thread(void)
 	if (!cfg_storage_enabled)
 		return 0;
 
+	th = thread_create(storage_softirq, k);
+	if (!th)
+		return -ENOMEM;
+
+	k->storage_softirq = th;
 	spdk_nvme_ctrlr_get_default_io_qpair_opts(controller, &opts, sizeof(opts));
 	max_xfer_size = spdk_nvme_ns_get_max_io_xfer_size(spdk_namespace);
 	entries = (4096 - 1) / max_xfer_size + 2;
@@ -256,152 +352,60 @@ int storage_init_thread(void)
 }
 
 /**
- * storage_proc_completions - process `budget` number of completions
+ * storage_init - initializes storage
+ *
  */
-int storage_proc_completions(struct storage_q *q, unsigned int budget,
-			     struct thread **wakeable_threads)
+int storage_init(void)
 {
-	assert_preempt_disabled();
+	int shm_id, rc;
+	struct spdk_env_opts opts;
+	void *buf;
 
 	if (!cfg_storage_enabled)
 		return 0;
 
-	cb_ths = wakeable_threads;
-	nrcb_ths = 0;
+	spdk_env_opts_init(&opts);
+	opts.name = "shenango runtime";
+	shm_id = rand_crc32c((uintptr_t)myk());
+	if (shm_id < 0)
+		shm_id = -shm_id;
+	opts.shm_id = shm_id;
 
-	if (!spin_try_lock(&q->lock))
-		return 0;
-
-	spdk_nvme_qpair_process_completions(q->spdk_qp_handle, budget);
-	q->outstanding_reqs -= nrcb_ths;
-	spin_unlock(&q->lock);
-
-	return nrcb_ths;
-}
-
-/*
- * storage_write - write a payload to the nvme device
- *                 expects lba_count*storage_block_size() bytes to be allocated in the buffer
- *
- * returns -ENOMEM if no available memory, and -EIO if the write operation failed
- */
-int storage_write(const void *payload, uint64_t lba, uint32_t lba_count)
-{
-	int rc;
-	struct kthread *k;
-	struct storage_q *q;
-	void *spdk_payload;
-
-	if (!cfg_storage_enabled)
-		return -ENODEV;
-
-	size_t req_size = lba_count * block_size;
-	bool use_thread_cache = req_size <= REQUEST_BUF_SZ;
-
-	k = getk();
-	q = &k->storage_q;
-
-	if (likely(use_thread_cache)) {
-		spdk_payload = tcache_alloc(&perthread_get(storage_buf_pt));
-	} else {
-		spdk_payload =
-			spdk_zmalloc(req_size, 0, NULL, SPDK_ENV_SOCKET_ID_ANY,
-				     SPDK_MALLOC_DMA);
+	if (spdk_env_init(&opts) < 0) {
+		log_err("Unable to initialize SPDK env");
+		return 1;
 	}
 
-	if (unlikely(spdk_payload == NULL)) {
-		putk();
+	rc = spdk_nvme_probe(NULL, NULL, probe_cb, attach_cb, NULL);
+	if (rc != 0) {
+		log_err("spdk_nvme_probe() failed");
+		return 1;
+	}
+
+	if (controller == NULL) {
+		log_err("no NVMe controllers found");
+		return 1;
+	}
+
+	buf = mem_map_anom(NULL, REQUEST_BUF_POOL_SZ, PGSIZE_2MB, 0);
+	if (buf == MAP_FAILED)
 		return -ENOMEM;
-	}
 
-	memcpy(spdk_payload, payload, req_size);
+	rc = spdk_mem_register(buf, REQUEST_BUF_POOL_SZ);
+	if (rc)
+		return rc;
 
-	spin_lock(&q->lock);
-	rc = spdk_nvme_ns_cmd_write(spdk_namespace, q->spdk_qp_handle,
-				    spdk_payload, lba, lba_count, seq_complete,
-				    thread_self(), 0);
+	rc = mempool_create(&storage_buf_mp, buf, REQUEST_BUF_POOL_SZ,
+			    PGSIZE_2MB, REQUEST_BUF_SZ);
+	if (rc)
+		return rc;
 
-	if (unlikely(rc != 0)) {
-		spin_unlock(&q->lock);
-		rc = -EIO;
-		goto done_np;
-	}
-
-	q->outstanding_reqs++;
-	thread_park_and_unlock_np(&q->lock);
-
-	preempt_disable();
-
-done_np:
-	if (likely(use_thread_cache))
-		tcache_free(&perthread_get(storage_buf_pt), spdk_payload);
-	else
-		spdk_free(spdk_payload);
-
-	preempt_enable();
-
-	return rc;
-}
-
-/*
- * storage_read - read a payload from the nvme device
- *                expects lba_count*storage_block_size() bytes to be allocated in the buffer
- *
- * returns -ENOMEM if no available memory, and -EIO if the write operation failed
- */
-int storage_read(void *dest, uint64_t lba, uint32_t lba_count)
-{
-	int rc;
-	struct kthread *k;
-	struct storage_q *q;
-	void *spdk_payload;
-
-	if (!cfg_storage_enabled)
-		return -ENODEV;
-
-	size_t req_size = lba_count * block_size;
-	bool use_thread_cache = req_size <= REQUEST_BUF_SZ;
-
-	k = getk();
-	q = &k->storage_q;
-
-	if (likely(use_thread_cache)) {
-		spdk_payload = tcache_alloc(&perthread_get(storage_buf_pt));
-	} else {
-		spdk_payload =
-			spdk_zmalloc(req_size, 0, NULL, SPDK_ENV_SOCKET_ID_ANY,
-				     SPDK_MALLOC_DMA);
-	}
-
-	if (unlikely(spdk_payload == NULL)) {
-		putk();
+	storage_buf_tcache = mempool_create_tcache(
+		&storage_buf_mp, "storagebufs", TCACHE_DEFAULT_MAG_SIZE);
+	if (!storage_buf_tcache)
 		return -ENOMEM;
-	}
 
-	spin_lock(&q->lock);
-	rc = spdk_nvme_ns_cmd_read(spdk_namespace, q->spdk_qp_handle,
-				   spdk_payload, lba, lba_count, seq_complete,
-				   thread_self(), 0);
-
-	if (unlikely(rc != 0)) {
-		spin_unlock(&q->lock);
-		rc = -EIO;
-		goto done_np;
-	}
-
-	q->outstanding_reqs++;
-	thread_park_and_unlock_np(&q->lock);
-	memcpy(dest, spdk_payload, req_size);
-	preempt_disable();
-
-done_np:
-	if (likely(use_thread_cache))
-		tcache_free(&perthread_get(storage_buf_pt), spdk_payload);
-	else
-		spdk_free(spdk_payload);
-	preempt_enable();
-
-	return rc;
+	return 0;
 }
 
 #else

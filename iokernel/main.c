@@ -133,9 +133,9 @@ void dataplane_loop(void)
 static void print_usage(void)
 {
 	printf("usage: POLICY [noht/core_list/nobw/mutualpair]\n");
-	printf("\tsimple: the standard, basic scheduler policy\n");
-	printf("\tias: a policy aware of CPU interference\n");
-	printf("\tnuma: a policy aware of NUMA architectures\n");
+	printf("\tsimple: a simplified scheduler policy intended for testing\n");
+	printf("\tias: the Caladan scheduler policy (manages CPU interference)\n");
+	printf("\tnuma: an incomplete and experimental policy for NUMA architectures\n");
 }
 
 int main(int argc, char *argv[])
@@ -159,7 +159,7 @@ int main(int argc, char *argv[])
 			return -EINVAL;
 		}
 	} else {
-		sched_ops = &simple_ops;
+		sched_ops = &ias_ops;
 	}
 
 	for (i = 2; i < argc; i++) {
@@ -178,6 +178,19 @@ int main(int argc, char *argv[])
 			}
 			cfg.ias_bw_limit = atof(argv[++i]);
 			log_info("setting bwlimit to %.5f", cfg.ias_bw_limit);
+		} else if (!strcmp(argv[i], "nicpci")) {
+			if (i == argc - 1) {
+				fprintf(stderr, "missing nicpci argument\n");
+				return -EINVAL;
+			}
+			nic_pci_addr_str = argv[++i];
+			ret = pci_str_to_addr(nic_pci_addr_str, &nic_pci_addr);
+			if (ret) {
+				log_err("invalid pci address: %s", nic_pci_addr_str);
+				return -EINVAL;
+			}
+		} else if (!strcmp(argv[i], "noidlefastwake")) {
+			cfg.noidlefastwake = true;
 		} else if (string_to_bitmap(argv[i], input_allowed_cores, NCPU)) {
 			fprintf(stderr, "invalid cpu list: %s\n", argv[i]);
 			fprintf(stderr, "example list: 0-24,26-48:2,49-255\n");

@@ -15,7 +15,11 @@
 #include "tcp.h"
 #include "defs.h"
 
-static void __tcp_rx_conn(tcpconn_t *c, struct mbuf *m, uint32_t ack, uint32_t snd_nxt, uint16_t win);
+#define TCP_SLOWPATH_FLAGS (TCP_FIN|TCP_RST|TCP_URG)
+
+static void __tcp_rx_conn(tcpconn_t *c, struct mbuf *m, uint32_t ack,
+			  uint32_t snd_nxt, uint32_t win,
+			  const unsigned char *optp, int optlen);
 
 /* four cases for the acceptability test for an incoming segment */
 static bool is_acceptable(tcpconn_t *c, uint32_t len, uint32_t seq)
@@ -38,14 +42,6 @@ static bool is_acceptable(tcpconn_t *c, uint32_t len, uint32_t seq)
 		wraps_lt(seq + len - 1, c->pcb.rcv_nxt + c->pcb.rcv_wnd));
 }
 
-/* is the TX window full? */
-static bool is_snd_full(tcpconn_t *c)
-{
-	assert_spin_lock_held(&c->lock);
-
-	return wraps_lte(c->pcb.snd_una + c->pcb.snd_wnd, c->pcb.snd_nxt);
-}
-
 /* see reset generation (RFC 793) */
 static void send_rst(tcpconn_t *c, bool acked, uint32_t seq, uint32_t ack,
 		     uint32_t len)
@@ -59,6 +55,7 @@ static void send_rst(tcpconn_t *c, bool acked, uint32_t seq, uint32_t ack,
 
 static void tcp_rx_append_text(tcpconn_t *c, struct mbuf *m)
 {
+	uint64_t nxt_wnd;
 	uint32_t len;
 
 	assert_spin_lock_held(&c->lock);
@@ -83,15 +80,14 @@ static void tcp_rx_append_text(tcpconn_t *c, struct mbuf *m)
 
 	/* enqueue the text */
 	assert(c->pcb.rcv_wnd >= m->seg_end - m->seg_seq);
-	uint64_t nxt_wnd =  (uint64_t)m->seg_end | ((uint64_t)(c->pcb.rcv_wnd - (m->seg_end - m->seg_seq)) << 32);
+	nxt_wnd = (uint64_t)m->seg_end;
+	nxt_wnd |= ((uint64_t)(c->pcb.rcv_wnd - (m->seg_end - m->seg_seq)) << 32);
 	store_release(&c->pcb.rcv_nxt_wnd, nxt_wnd);
-	if (unlikely(c->pcb.rcv_wnd <= 2))
-		c->rcv_wnd_full = true;
 	list_add_tail(&c->rxq, &m->link);
 }
 
 /* process RX text segments, returning true if @m is used for text */
-static bool tcp_rx_text(tcpconn_t *c, struct mbuf *m, bool *wake)
+static bool tcp_rx_text(tcpconn_t *c, struct mbuf *m, bool *wake, bool *fin)
 {
 	struct mbuf *pos;
 
@@ -104,8 +100,11 @@ static bool tcp_rx_text(tcpconn_t *c, struct mbuf *m, bool *wake)
 	if (wraps_lte(m->seg_seq, c->pcb.rcv_nxt)) {
 		/* we got the next in-order segment */
 		STAT(RX_TCP_IN_ORDER)++;
-		if ((m->flags & (TCP_PUSH | TCP_FIN)) > 0)
+		if ((m->flags & (TCP_PUSH | TCP_FIN)) != 0 ||
+		    !list_empty(&c->rxq)) {
 			*wake = true;
+			*fin |= (m->flags & TCP_FIN) > 0;
+		}
 		tcp_rx_append_text(c, m);
 	} else {
 		/* we got an out-of-order segment */
@@ -150,8 +149,8 @@ drain:
 		/* we got the next in-order segment */
 		list_del(&pos->link);
 		c->rxq_ooo_len--;
-		if ((pos->flags & (TCP_PUSH | TCP_FIN)) > 0)
-			*wake = true;
+		*wake = true;
+		*fin |= (pos->flags & TCP_FIN) > 0;
 		tcp_rx_append_text(c, pos);
 	}
 
@@ -166,17 +165,17 @@ void tcp_rx_conn(struct trans_entry *e, struct mbuf *m)
 {
 	tcpconn_t *c = container_of(e, tcpconn_t, e);
 	struct list_head q;
-	thread_t *rx_th;
+	thread_t *rx_th = NULL;
 	const struct ip_hdr *iphdr;
 	const struct tcp_hdr *tcphdr;
+	const unsigned char *optp;
+	int optlen;
 	uint64_t nxt_wnd;
-	uint32_t seq, ack, len, snd_nxt, hdr_len;
-	uint16_t win;
+	uint32_t seq, ack, len, snd_nxt, hdr_len, win;
+	bool do_ack = false, slow_path;
 
 	list_head_init(&q);
 	snd_nxt = load_acquire(&c->pcb.snd_nxt);
-
-	uint64_t now = microtime();
 
 	/* find header offsets */
 	iphdr = mbuf_network_hdr(m, *iphdr);
@@ -190,14 +189,14 @@ void tcp_rx_conn(struct trans_entry *e, struct mbuf *m)
 	/* parse header */
 	seq = ntoh32(tcphdr->seq);
 	ack = ntoh32(tcphdr->ack);
-	win = ntoh16(tcphdr->win);
-	hdr_len = tcphdr->off * 4;
+	win = (uint32_t)ntoh16(tcphdr->win) << c->pcb.snd_wscale;
+	hdr_len = tcphdr->off * sizeof(uint32_t);
 	if (unlikely(hdr_len < sizeof(struct tcp_hdr))) {
 		mbuf_free(m);
 		return;
 	}
 	len = ntoh16(iphdr->len) - sizeof(*iphdr) - hdr_len;
-	if (unlikely(len > mbuf_length(m))) {
+	if (unlikely(len > mbuf_length(m) || len > c->pcb.rcv_mss)) {
 		mbuf_free(m);
 		return;
 	}
@@ -206,76 +205,149 @@ void tcp_rx_conn(struct trans_entry *e, struct mbuf *m)
 	m->seg_end = seq + len;
 	m->flags = tcphdr->flags;
 
-	mbuf_pull(m, hdr_len - sizeof(struct tcp_hdr)); /* strip off options */
+	/* pull off options */
+	optlen = hdr_len - sizeof(struct tcp_hdr);
+	optp = mbuf_pull(m, optlen);
 
-	/* Use slow path if this is not an ACK|PUSH */
-	bool slow_path = (tcphdr->flags != (TCP_ACK | TCP_PUSH)) ||
-	                 (len == 0) || wraps_gt(ack, snd_nxt);
+	/* Use slow path if not regular flags and the next segment */
+	slow_path = (tcphdr->flags & TCP_SLOWPATH_FLAGS) != 0 ||
+	            (len == 0) || wraps_gt(ack, snd_nxt);
 
 	spin_lock_np(&c->lock);
 
+	/* Is the connection in the established state? */
 	slow_path |= (c->pcb.state != TCP_STATE_ESTABLISHED);
 
-	/* might we need to unblock waiting senders? */
-	slow_path |= is_snd_full(c);
+	/* Might we need to unblock waiting senders? */
+	slow_path |= tcp_is_snd_full(c);
 
 	/* Is the packet on the next in-order boundary? */
 	slow_path |= (seq != c->pcb.rcv_nxt) || !list_empty(&c->rxq_ooo);
 
-	/* Does it fit perfectly in the receive window?  */
-	slow_path |= wraps_lt(c->pcb.rcv_wnd, len);
+	/* Does it fit perfectly in the receive window? */
+	slow_path |= c->pcb.rcv_wnd < len;
+
+	/* Does the ack land outside snd_nxt? */
+	slow_path |= wraps_gt(ack, snd_nxt);
 
 	if (unlikely(slow_path))
-		return __tcp_rx_conn(c, m, ack, snd_nxt, win);
+		return __tcp_rx_conn(c, m, ack, snd_nxt, win, optp, optlen);
 
 	STAT(RX_TCP_IN_ORDER)++;
 
-	c->rep_acks *= c->pcb.snd_una == ack;
-	c->pcb.snd_una = ack;
-	tcp_conn_ack(c, &q);
+	/* process acks and update send window */
+	if (wraps_lte(c->pcb.snd_una, ack)) {
+		/* did sent segments get acked? */
+		if (c->pcb.snd_una != ack) {
+			c->rep_acks = 0;
+			c->pcb.snd_una = ack;
+			tcp_conn_ack(c, &q);
+		}
 
-	/* should we update the send window? */
-	if (wraps_lt(c->pcb.snd_wl1, seq) ||
-	    (c->pcb.snd_wl1 == seq &&
-	     wraps_lte(c->pcb.snd_wl2, ack))) {
-		c->pcb.snd_wnd = win > 1 ? win - 2 : 0; // reserve 1 byte for FIN and one byte for the sequence number on an RST packet
-		c->pcb.snd_wl1 = seq;
-		c->pcb.snd_wl2 = ack;
-		c->rep_acks = 0;
+		/* should we update the send window? */
+		if (wraps_lt(c->pcb.snd_wl1, seq) ||
+		    (c->pcb.snd_wl1 == seq &&
+		     wraps_lte(c->pcb.snd_wl2, ack))) {
+			c->pcb.snd_wnd = win;
+			c->pcb.snd_wl1 = seq;
+			c->pcb.snd_wl2 = ack;
+			c->rep_acks = 0;
+		}
 	}
 
 	nxt_wnd = (uint64_t)m->seg_end;
 	nxt_wnd |= ((uint64_t)(c->pcb.rcv_wnd - len) << 32);
 	store_release(&c->pcb.rcv_nxt_wnd, nxt_wnd);
 
-	c->rcv_wnd_full = c->pcb.rcv_wnd <= 2;
+	/* should we wake a thread */
+	if (!list_empty(&c->rxq) || (tcphdr->flags & TCP_PUSH) > 0)
+		rx_th = waitq_signal(&c->rx_wq, &c->lock);
+
+	/* handle delayed acks */
+	if (++c->acks_delayed_cnt >= 2) {
+		c->ack_delayed = false;
+		do_ack = true;
+		c->acks_delayed_cnt = 0;
+	} else if (!c->ack_delayed) {
+		c->ack_ts = microtime();
+		c->ack_delayed = true;
+		c->next_timeout = MIN(c->next_timeout, c->ack_ts + TCP_ACK_TIMEOUT);
+	}
 
 	list_add_tail(&c->rxq, &m->link);
-	rx_th = waitq_signal(&c->rx_wq, &c->lock);
-
-	if (!c->ack_delayed)
-		c->ack_ts = now;
-
-	c->ack_delayed = true;
-
-	c->next_timeout = MIN(c->next_timeout, c->ack_ts + TCP_ACK_TIMEOUT);
-
 	tcp_debug_ingress_pkt(c, m);
 	spin_unlock_np(&c->lock);
 
 	/* deferred work (delayed until after the lock was dropped) */
 	waitq_signal_finish(rx_th);
 	mbuf_list_free(&q);
+	if (do_ack)
+		tcp_tx_ack(c);
+}
+
+static int tcp_parse_options(tcpconn_t *c, const unsigned char *ptr, int len)
+{
+	int opt_en = 0;
+	uint16_t mss = 0;
+	uint8_t wscale = 0;
+
+	while (len > 0) {
+		int opcode = *ptr++;
+		int opsize;
+
+		switch(opcode) {
+		case TCP_OPT_EOL:
+			goto done;
+		case TCP_OPT_NOP:
+			len--;
+			continue;
+		case TCP_OPT_MSS:
+			opsize = *ptr++;
+			if (opsize == TCP_OLEN_MSS) {
+				mss = ntoh16(*(uint16_t *)ptr);
+				opt_en |= TCP_OPTION_MSS;
+			}
+			break;
+		case TCP_OPT_WSCALE:
+			opsize = *ptr++;
+			if (opsize == TCP_OLEN_WSCALE) {
+				wscale = *(uint8_t *)ptr;
+				if (wscale > 14)
+					wscale = 14;
+				opt_en |= TCP_OPTION_WSCALE;
+			}
+			break;
+		default:
+			opsize = *ptr++;
+		}
+		ptr += opsize-2;
+		len -= opsize;
+	}
+
+done:
+	c->pcb.snd_mss = MIN(MAX(mss, TCP_MIN_MSS), c->pcb.rcv_mss);
+	c->pcb.snd_wscale = wscale;
+	if (!(opt_en & TCP_OPTION_WSCALE)) {
+		c->pcb.rcv_wnd = c->winmax = MIN(c->winmax, UINT16_MAX);
+		c->pcb.rcv_wscale = 0;
+	}
+	if (!(opt_en & TCP_OPTION_MSS)) {
+		c->pcb.snd_mss = tcp_calculate_mss(ETH_DEFAULT_MTU);
+	}
+	return opt_en;
 }
 
 /* slow path for handling ingress packets for TCP connections */
-static __noinline void __tcp_rx_conn(tcpconn_t *c, struct mbuf *m, uint32_t ack, uint32_t snd_nxt, uint16_t win)
+static __noinline void
+__tcp_rx_conn(tcpconn_t *c, struct mbuf *m, uint32_t ack, uint32_t snd_nxt,
+	      uint32_t win, const unsigned char *optp, int optlen)
 {
 	struct list_head q, waiters;
 	thread_t *rx_th = NULL;
 	struct mbuf *retransmit = NULL;
 	uint32_t seq, len;
-	bool do_ack = false, do_drop = true;
+	bool do_ack = false, do_drop = true, fin = false, snd_was_full;
+	bool ack_same = false, wnd_updated = false;
 	int ret;
 
 	list_head_init(&q);
@@ -312,20 +384,27 @@ static __noinline void __tcp_rx_conn(tcpconn_t *c, struct mbuf *m, uint32_t ack,
 			goto done;
 		}
 		if ((m->flags & TCP_SYN) > 0) {
+			struct tcp_options opts;
 			c->pcb.rcv_nxt = seq + 1;
 			c->pcb.irs = seq;
+
+			/* set up options */
+			opts.opt_en = tcp_parse_options(c, optp, optlen);
+			opts.mss = c->pcb.rcv_mss;
+			opts.wscale = c->pcb.rcv_wscale;
+
 			if ((m->flags & TCP_ACK) > 0) {
 				c->pcb.snd_una = ack;
 				tcp_conn_ack(c, &q);
 			}
 			if (wraps_gt(c->pcb.snd_una, c->pcb.iss)) {
 				do_ack = true;
-				c->pcb.snd_wnd = win > 1 ? win - 2 : 0; // reserve 1 byte for FIN and one byte for the sequence number on an RST packet
+				c->pcb.snd_wnd = win;
 				c->pcb.snd_wl1 = seq;
 				c->pcb.snd_wl2 = ack;
 				tcp_conn_set_state(c, TCP_STATE_ESTABLISHED);
 			} else {
-				ret = tcp_tx_ctl(c, TCP_SYN | TCP_ACK);
+				ret = tcp_tx_ctl(c, TCP_SYN | TCP_ACK, &opts);
 				if (unlikely(ret)) {
 					goto done; /* feign packet loss */
 				}
@@ -374,21 +453,49 @@ static __noinline void __tcp_rx_conn(tcpconn_t *c, struct mbuf *m, uint32_t ack,
 			do_drop = true;
 			goto done;
 		}
-		c->pcb.snd_wnd = win > 1 ? win - 2 : 0; // reserve 1 byte for FIN and one byte for the sequence number on an RST packet
+		c->pcb.snd_wnd = win;
 		c->pcb.snd_wl1 = seq;
 		c->pcb.snd_wl2 = ack;
 		tcp_conn_set_state(c, TCP_STATE_ESTABLISHED);
 	}
+
+	/* process ack and window update */
+	snd_was_full = tcp_is_snd_full(c);
+	if (wraps_lte(c->pcb.snd_una, ack) && wraps_lte(ack, snd_nxt)) {
+		/* did sent segments get acked? */
+		if (c->pcb.snd_una != ack) {
+			c->pcb.snd_una = ack;
+			tcp_conn_ack(c, &q);
+		} else {
+			ack_same = true;
+		}
+
+		/* should we update the send window? */
+		if (wraps_lt(c->pcb.snd_wl1, seq) ||
+		    (c->pcb.snd_wl1 == seq &&
+		     wraps_lte(c->pcb.snd_wl2, ack))) {
+			if (c->pcb.snd_wnd != win || c->pcb.snd_wl2 != ack)
+				wnd_updated = true;
+			c->pcb.snd_wnd = win;
+			c->pcb.snd_wl1 = seq;
+			c->pcb.snd_wl2 = ack;
+		}
+	} else if (wraps_gt(ack, snd_nxt)) {
+		do_ack = true;
+		goto done;
+	}
+	if (snd_was_full && !tcp_is_snd_full(c))
+		waitq_release_start(&c->tx_wq, &waiters);
+
 	/*
-	 * Detect a duplicate ACK if:
+	 * Fast retransmit -> detect a duplicate ACK if:
 	 * 1. The ACK number is the same as the largest seen.
 	 * 2. There is unacknowledged data pending.
 	 * 3. There is no data payload included with the ACK.
 	 * 4. There is no window update.
 	 */
-	if (unlikely(ack == c->pcb.snd_una &&
-	    c->pcb.snd_una != c->pcb.snd_nxt &&
-	    len == 0)) {
+	if (unlikely(ack_same && c->pcb.snd_una != c->pcb.snd_nxt &&
+		     len == 0 && !wnd_updated)) {
 		c->rep_acks++;
 		if (c->rep_acks >= TCP_FAST_RETRANSMIT_THRESH) {
 			if (c->tx_exclusive) {
@@ -399,31 +506,9 @@ static __noinline void __tcp_rx_conn(tcpconn_t *c, struct mbuf *m, uint32_t ack,
 			}
 			c->rep_acks = 0;
 		}
+	} else if (c->pcb.snd_una == ack) {
+		c->rep_acks = 0;
 	}
-	bool snd_was_full = is_snd_full(c);
-	if (wraps_lte(c->pcb.snd_una, ack) &&
-	    wraps_lte(ack, snd_nxt)) {
-		if (c->pcb.snd_una != ack)
-			c->rep_acks = 0;
-		c->pcb.snd_una = ack;
-		tcp_conn_ack(c, &q);
-	} else if (wraps_gt(ack, snd_nxt)) {
-		do_ack = true;
-		goto done;
-	}
-	/* should we update the send window? */
-	if (wraps_lt(c->pcb.snd_wl1, seq) ||
-	    (c->pcb.snd_wl1 == seq &&
-	     wraps_lte(c->pcb.snd_wl2, ack))) {
-		uint32_t old_wnd = c->pcb.snd_wnd;
-		c->pcb.snd_wnd = win > 1 ? win - 2 : 0; // reserve 1 byte for FIN and one byte for the sequence number on an RST packet
-		c->pcb.snd_wl1 = seq;
-		c->pcb.snd_wl2 = ack;
-		if (c->pcb.snd_wnd != old_wnd)
-			c->rep_acks = 0;
-	}
-	if (snd_was_full && !is_snd_full(c))
-		waitq_release_start(&c->tx_wq, &waiters);
 
 	if (c->pcb.state == TCP_STATE_FIN_WAIT1 &&
 	    c->pcb.snd_una == snd_nxt) {
@@ -451,10 +536,10 @@ static __noinline void __tcp_rx_conn(tcpconn_t *c, struct mbuf *m, uint32_t ack,
 
 #ifdef TCP_RX_STATS
 		uint64_t before_tsc = rdtsc();
-		do_drop = !tcp_rx_text(c, m, &wake);
+		do_drop = !tcp_rx_text(c, m, &wake, &fin);
 		STAT(RX_TCP_TEXT_CYCLES) += rdtsc() - before_tsc;
 #else
-		do_drop = !tcp_rx_text(c, m, &wake);
+		do_drop = !tcp_rx_text(c, m, &wake, &fin);
 #endif
 
 		if (wake) {
@@ -462,7 +547,9 @@ static __noinline void __tcp_rx_conn(tcpconn_t *c, struct mbuf *m, uint32_t ack,
 			assert(do_drop == false);
 			rx_th = waitq_signal(&c->rx_wq, &c->lock);
 		}
-		if (!c->ack_delayed) {
+		if (++c->acks_delayed_cnt >= 2) {
+			do_ack = true;
+		} else if (!c->ack_delayed) {
 			c->ack_delayed = true;
 			c->ack_ts = microtime();
 		}
@@ -470,10 +557,10 @@ static __noinline void __tcp_rx_conn(tcpconn_t *c, struct mbuf *m, uint32_t ack,
 	}
 
 	/* step 8 - FIN */
-	if (likely((m->flags & TCP_FIN) == 0))
+	if (likely(!fin))
 		goto done;
-	if (c->pcb.state == TCP_STATE_SYN_RECEIVED ||
-	    c->pcb.state == TCP_STATE_ESTABLISHED) {
+	assert(c->pcb.state != TCP_STATE_SYN_RECEIVED);
+	if (c->pcb.state == TCP_STATE_ESTABLISHED) {
 		tcp_conn_set_state(c, TCP_STATE_CLOSE_WAIT);
 	} else if (c->pcb.state == TCP_STATE_FIN_WAIT1) {
 		assert(c->pcb.snd_una != snd_nxt);
@@ -487,6 +574,10 @@ static __noinline void __tcp_rx_conn(tcpconn_t *c, struct mbuf *m, uint32_t ack,
 done:
 	tcp_timer_update(c);
 	tcp_debug_ingress_pkt(c, m);
+	if (do_ack) {
+		c->ack_delayed = false;
+		c->acks_delayed_cnt = 0;
+	}
 	spin_unlock_np(&c->lock);
 
 	/* deferred work (delayed until after the lock was dropped) */
@@ -507,8 +598,11 @@ tcpconn_t *tcp_rx_listener(struct netaddr laddr, struct mbuf *m)
 	struct netaddr raddr;
 	const struct ip_hdr *iphdr;
 	const struct tcp_hdr *tcphdr;
+	const unsigned char *optp;
 	tcpconn_t *c;
-	int ret;
+	struct tcp_options opts;
+	uint32_t hdr_len;
+	int optlen, ret;
 
 	/* find header offsets */
 	iphdr = mbuf_network_hdr(m, *iphdr);
@@ -531,7 +625,14 @@ tcpconn_t *tcp_rx_listener(struct netaddr laddr, struct mbuf *m)
 		return NULL;
 
 	/* TODO: the spec requires us to enqueue but not post any data */
-	if (ntoh16(iphdr->len) - sizeof(*iphdr) != tcphdr->off * 4)
+	hdr_len = tcphdr->off * sizeof(uint32_t);
+	if (ntoh16(iphdr->len) - sizeof(*iphdr) != hdr_len)
+		return NULL;
+
+	/* parse options */
+	optlen = hdr_len - sizeof(struct tcp_hdr);
+	optp = mbuf_pull_or_null(m, optlen);
+	if (!optp)
 		return NULL;
 
 	/* we have a valid SYN packet, initialize a new connection */
@@ -540,6 +641,11 @@ tcpconn_t *tcp_rx_listener(struct netaddr laddr, struct mbuf *m)
 		return NULL;
 	c->pcb.irs = ntoh32(tcphdr->seq);
 	c->pcb.rcv_nxt = c->pcb.irs + 1;
+
+	/* set up options */
+	opts.opt_en = tcp_parse_options(c, optp, optlen);
+	opts.mss = c->pcb.rcv_mss;
+	opts.wscale = c->pcb.rcv_wscale;
 
 	/*
 	 * attach the connection to the transport layer. From this point onward
@@ -554,7 +660,7 @@ tcpconn_t *tcp_rx_listener(struct netaddr laddr, struct mbuf *m)
 
 	/* finally, send a SYN/ACK to the remote host */
 	spin_lock_np(&c->lock);
-	ret = tcp_tx_ctl(c, TCP_SYN | TCP_ACK);
+	ret = tcp_tx_ctl(c, TCP_SYN | TCP_ACK, &opts);
 	if (unlikely(ret)) {
 		spin_unlock_np(&c->lock);
 		tcp_conn_destroy(c);

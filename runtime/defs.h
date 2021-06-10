@@ -33,13 +33,11 @@
 #define RUNTIME_STACK_SIZE		256 * KB
 #define RUNTIME_GUARD_SIZE		256 * KB
 #define RUNTIME_RQ_SIZE			32
-#define RUNTIME_SOFTIRQ_LOCAL_BUDGET	16
-#define RUNTIME_SOFTIRQ_REMOTE_BUDGET	16
 #define RUNTIME_MAX_TIMERS		4096
 #define RUNTIME_SCHED_POLL_ITERS	0
 #define RUNTIME_SCHED_MIN_POLL_US	2
 #define RUNTIME_WATCHDOG_US		50
-#define RUNTIME_PMC_US			10
+#define RUNTIME_RX_BATCH_SIZE		32
 
 
 /*
@@ -88,12 +86,6 @@ struct thread_tf {
  * Thread support
  */
 
-enum {
-	THREAD_STATE_RUNNING = 0,
-	THREAD_STATE_RUNNABLE,
-	THREAD_STATE_SLEEPING,
-};
-
 struct stack;
 
 struct thread {
@@ -101,8 +93,8 @@ struct thread {
 	struct list_node	link;
 	struct stack		*stack;
 	unsigned int		main_thread:1;
-	unsigned int		state;
-	unsigned int		stack_busy;
+	unsigned int		thread_ready;
+	unsigned int		thread_running;
 	unsigned int		last_cpu;
 	uint64_t		run_start_tsc;
 	uint64_t		ready_tsc;
@@ -119,7 +111,7 @@ typedef void (*runtime_fn_t)(void);
 extern void __jmp_thread(struct thread_tf *tf) __noreturn;
 extern void __jmp_thread_direct(struct thread_tf *oldtf,
 				struct thread_tf *newtf,
-				unsigned int *stack_busy);
+				unsigned int *thread_running);
 extern void __jmp_runtime(struct thread_tf *tf, runtime_fn_t fn,
 			  void *stack);
 extern void __jmp_runtime_nosave(runtime_fn_t fn, void *stack) __noreturn;
@@ -237,18 +229,19 @@ struct iokernel_control {
 extern struct iokernel_control iok;
 extern void *iok_shm_alloc(size_t size, size_t alignment, shmptr_t *shm_out);
 
+
 /*
  * Direct hardware queue support
  */
 
 struct hardware_q {
 	void		*descriptor_table;
-	uint32_t		*consumer_idx;
-	uint32_t		*shadow_tail;
-	uint32_t		descriptor_log_size;
-	uint32_t		nr_descriptors;
-	uint32_t		parity_byte_offset;
-	uint32_t		parity_bit_mask;
+	uint32_t	*consumer_idx;
+	uint32_t	*shadow_tail;
+	uint32_t	descriptor_log_size;
+	uint32_t	nr_descriptors;
+	uint32_t	parity_byte_offset;
+	uint32_t	parity_bit_mask;
 };
 
 static inline bool hardware_q_pending(struct hardware_q *q)
@@ -266,6 +259,7 @@ static inline bool hardware_q_pending(struct hardware_q *q)
 	return parity == hd_parity;
 }
 
+
 /*
  * Storage support
  */
@@ -273,6 +267,7 @@ static inline bool hardware_q_pending(struct hardware_q *q)
 #ifdef DIRECT_STORAGE
 
 extern bool cfg_storage_enabled;
+extern unsigned long storage_device_latency_us;
 
 struct storage_q {
 
@@ -293,13 +288,10 @@ static inline bool storage_available_completions(struct storage_q *q)
 
 static inline bool storage_pending_completions(struct storage_q *q)
 {
-	extern unsigned long device_latency_us;
 	return cfg_storage_enabled && q->outstanding_reqs > 0 &&
-	       device_latency_us <= 10;
+	       storage_device_latency_us <= 10;
 }
 
-extern int storage_proc_completions(struct storage_q *q,
-	    unsigned int budget, struct thread **wakeable_threads);
 #else
 
 struct storage_q {};
@@ -312,13 +304,6 @@ static inline bool storage_available_completions(struct storage_q *q)
 static inline bool storage_pending_completions(struct storage_q *q)
 {
 	return false;
-}
-
-
-static inline int storage_proc_completions(struct storage_q *q,
-	    unsigned int budget, struct thread **wakeable_threads)
-{
-	return 0;
 }
 
 #endif
@@ -375,7 +360,10 @@ enum {
 	STAT_NR,
 };
 
-struct timer_idx;
+struct timer_idx {
+	uint64_t		deadline_us;
+	struct timer_entry	*e;
+};
 
 struct kthread {
 	/* 1st cache-line */
@@ -412,15 +400,23 @@ struct kthread {
 	spinlock_t		timer_lock;
 	unsigned int		timern;
 	struct timer_idx	*timers;
-	unsigned long		pad2[6];
+	thread_t		*iokernel_softirq;
+	thread_t		*directpath_softirq;
+	thread_t		*timer_softirq;
+	thread_t		*storage_softirq;
+	bool			iokernel_busy;
+	bool			directpath_busy;
+	bool			timer_busy;
+	bool			storage_busy;
+	unsigned int		pad2[3];
 
 	/* 9th cache-line, storage nvme queues */
-	struct storage_q		storage_q;
+	struct storage_q	storage_q;
 
 	/* 10th cache-line, direct path queues */
-	struct hardware_q		*directpath_rxq;
-	struct direct_txq		*directpath_txq;
-	unsigned long		pad4[6];
+	struct hardware_q	*directpath_rxq;
+	struct direct_txq	*directpath_txq;
+	unsigned long		pad3[6];
 
 	/* 11th cache-line, statistics counters */
 	uint64_t		stats[STAT_NR];
@@ -502,13 +498,10 @@ extern int preferred_socket;
  * Softirq support
  */
 
-/* the maximum number of events to handle in a softirq invocation */
-#define SOFTIRQ_MAX_BUDGET	128
-
 extern bool disable_watchdog;
-
-extern thread_t *softirq_run_thread(struct kthread *k, unsigned int budget);
-extern void softirq_run(unsigned int budget);
+extern bool softirq_pending(struct kthread *k);
+extern bool softirq_sched(struct kthread *k);
+extern bool softirq_run(void);
 
 
 /*
@@ -537,7 +530,6 @@ struct cfg_arp_static_entry {
 extern int arp_static_count;
 extern struct cfg_arp_static_entry static_entries[MAX_ARP_STATIC_ENTRIES];
 
-extern void __net_recurrent(void);
 extern void net_rx_softirq(struct rx_net_hdr **hdrs, unsigned int nr);
 extern void net_rx_softirq_direct(struct mbuf **ms, unsigned int nr);
 
@@ -579,67 +571,37 @@ static inline size_t directpath_rx_buf_pool_sz(unsigned int nrqs)
 
 #endif
 
+extern unsigned int eth_mtu;
+
+/**
+ * net_get_mtu - gets the ethernet MTU (maximum transmission unit)
+ */
+static inline unsigned int net_get_mtu(void)
+{
+	return eth_mtu;
+}
 
 
 /*
- * Timer support
+ * Runtime configuration infrastructure
  */
 
-extern void timer_softirq(struct kthread *k, unsigned int budget);
-extern uint64_t timer_earliest_deadline(void);
-
-struct timer_idx {
-	uint64_t		deadline_us;
-	struct timer_entry	*e;
+typedef int (*cfg_fn_t)(const char *name, const char *val);
+struct cfg_handler {
+	const char			*name;
+	cfg_fn_t			fn;
+	bool				required;
+	struct list_node		link;
 };
 
-/**
- * timer_needed - returns true if pending timers have to be handled
- * @k: the kthread to check
- */
-static inline bool timer_needed(struct kthread *k)
-{
-	/* deliberate race condition */
-	return k->timern > 0 && k->timers[0].deadline_us <= microtime();
+#define REGISTER_CFG(c)					\
+ __attribute__((constructor))					\
+void register_cfg_init_##c (void)				\
+{								\
+	extern void cfg_register(struct cfg_handler *h);	\
+	cfg_register(&c);					\
 }
 
-
-static inline bool softirq_work_available(struct kthread *k)
-{
-	bool work_available;
-
-	if (unlikely(is_world_stopped()))
-		return false;
-
-	work_available = rx_pending(k->directpath_rxq) ||
-	  !lrpc_empty(&k->rxq) || timer_needed(k);
-
-	work_available |= storage_available_completions(&k->storage_q);
-
-	return work_available;
-}
-
-static inline bool timer_available_soon(struct kthread *k, uint64_t now)
-{
-	return k->timern > 0 &&
-		(k->timers[0].deadline_us - 10) * cycles_per_us + start_tsc <= now;
-}
-
-/**
- * softirq_work_soon - returns true if a softirq is likely
- * to be ready in the next 10us
- *
- * @k: the kthread to check
- * @now: current timestamp
- */
-static inline bool softirq_work_soon(struct kthread *k, uint64_t now)
-{
-	if (unlikely(is_world_stopped()))
-		return false;
-
-	return storage_pending_completions(&k->storage_q) ||
-		timer_available_soon(k, now);
-}
 
 /*
  * Init
@@ -664,6 +626,7 @@ extern int stack_init(void);
 extern int sched_init(void);
 extern int preempt_init(void);
 extern int net_init(void);
+extern int udp_init(void);
 extern int arp_init(void);
 extern int trans_init(void);
 extern int smalloc_init(void);
@@ -684,8 +647,10 @@ extern int directpath_init_late(void);
 /* configuration loading */
 extern int cfg_load(const char *path);
 
-/* runtime entry helpers */
+/* internal runtime scheduling functions */
 extern void sched_start(void) __noreturn;
 extern int thread_spawn_main(thread_fn_t fn, void *arg);
 extern void thread_cede(void);
+extern void thread_ready_locked(thread_t *th);
+extern void thread_ready_head_locked(thread_t *th);
 extern void join_kthread(struct kthread *k);
