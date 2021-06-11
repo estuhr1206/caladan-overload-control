@@ -68,7 +68,9 @@ struct crpc_ctx {
 	void*			arg;
 };
 
-typedef void (*crpc_fn_t)(struct crpc_ctx *ctx);
+// local drop handler
+typedef void (*crpc_ldrop_fn_t)(struct crpc_ctx *ctx);
+typedef void (*crpc_rdrop_fn_t)(void *buf, size_t len, void *arg);
 
 struct crpc_conn {
 	tcpconn_t		*c;
@@ -77,7 +79,8 @@ struct crpc_conn {
 struct crpc_session {
 	struct crpc_conn	*c[CRPC_MAX_REPLICA];
 	int			nconns;
-	crpc_fn_t		drop_handler;
+	crpc_ldrop_fn_t		ldrop_handler;
+	crpc_rdrop_fn_t		rdrop_handler;
 };
 
 struct crpc_ops {
@@ -95,6 +98,7 @@ struct crpc_ops {
 	 * @ident: the unique identifier associated with the request
 	 * @buf: the payload buffer to send
 	 * @len: the length of @buf (up to SRPC_BUF_SIZE)
+	 * @arg: (optional) arguments provided to the drop handler for a context
 	 *
 	 * WARNING: This function could block.
 	 *
@@ -109,14 +113,14 @@ struct crpc_ops {
 	 * @s: the RPC session to receive from
 	 * @buf: a buffer to store the received payload
 	 * @len: the length of @buf (up to SRPC_BUF_SIZE)
+	 * @arg: (optional) arguments provided to the drop handler for a context
 	 *
 	 * WARNING: This function could block.
 	 *
 	 * On success, returns the length received in bytes. On failure returns standard
 	 * socket errors (<= 0).
 	 */
-	ssize_t (*crpc_recv_one)(struct crpc_conn *s,
-				 void *buf, size_t len, bool *dropped);
+	ssize_t (*crpc_recv_one)(struct crpc_conn *s, void *buf, size_t len, void *arg);
 
 	/**
 	 * crpc_open - creates an RPC session
@@ -128,7 +132,8 @@ struct crpc_ops {
 	 * Returns 0 if successful.
 	 */
 	int (*crpc_open)(struct netaddr raddr, struct crpc_session **sout,
-			 int id, crpc_fn_t drop_handler);
+			 int id, crpc_ldrop_fn_t ldrop_handler,
+			 crpc_rdrop_fn_t rdrop_handler);
 
 	/**
 	 * crpc_close - closes an RPC session

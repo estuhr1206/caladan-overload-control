@@ -174,12 +174,13 @@ struct cstat {
 struct work_unit {
   double start_us, work_us, duration_us;
   int hash;
+  bool success;
   uint64_t window;
   uint64_t tsc;
   uint32_t cpu;
   uint64_t server_queue;
   uint64_t server_time;
-  bool success;
+  uint64_t timing;
 };
 
 class NetBarrier {
@@ -530,7 +531,7 @@ void LoadBalancer(struct srpc_ctx *ctx) {
   delete resp_ctx;
 }
 
-void LBDropHandler(struct crpc_ctx *c) {
+void LBLocalDropHandler(struct crpc_ctx *c) {
   LBCTX<payload> *ctx =
 	  rpc::LoadBalancer<payload, PAYLOAD_ID_OFF>::GetCTX(c->buf);
 
@@ -539,11 +540,21 @@ void LBDropHandler(struct crpc_ctx *c) {
   ctx->Done();
 }
 
+void LBRemoteDropHandler(void *buf, size_t len, void *arg) {
+  assert(len == sizeof(payload));
+  LBCTX<payload> *ctx =
+	  rpc::LoadBalancer<payload, PAYLOAD_ID_OFF>::GetCTX((char *)buf);
+
+  ctx->dropped = true;
+  ctx->Done();
+}
+
 void LBHandler(void *arg) {
   rt::Thread([] { RPCSStatServer(); }).Detach();
 
   load_balancer[0] = new rpc::LoadBalancer<payload, PAYLOAD_ID_OFF>(raddr,
-			num_servers, kNumDupClient, nconn[0], LBDropHandler);
+			num_servers, kNumDupClient, nconn[0], LBLocalDropHandler,
+			LBRemoteDropHandler);
 
   /* Start Server */
   int ret = rpc::RpcServerEnable(LoadBalancer);
@@ -580,7 +591,7 @@ void FanOut(struct srpc_ctx *ctx) {
   delete resp_ctx;
 }
 
-void FODropHandler(struct crpc_ctx *c) {
+void FOLocalDropHandler(struct crpc_ctx *c) {
   FOCTX<payload> *ctx = rpc::FanOuter<payload, PAYLOAD_ID_OFF>::GetCTX(c->buf);
   int idx = ctx->num_resp++;
 
@@ -589,11 +600,22 @@ void FODropHandler(struct crpc_ctx *c) {
   ctx->Done();
 }
 
+void FORemoteDropHandler(void *buf, size_t len, void *arg) {
+  assert(len == sizeof(payload));
+  FOCTX<payload> *ctx =
+	  rpc::FanOuter<payload, PAYLOAD_ID_OFF>::GetCTX((char *)buf);
+  int idx = ctx->num_resp++;
+
+  ctx->dropped[idx] = true;
+  ctx->Done();
+}
+
 void FOHandler(void *arg) {
   rt::Thread([] { RPCSStatServer(); }).Detach();
 
   fan_outer = new rpc::FanOuter<payload, PAYLOAD_ID_OFF>(raddr,
-			num_servers, kNumDupClient, nconn[0], FODropHandler);
+			num_servers, kNumDupClient, nconn[0],
+			FOLocalDropHandler, FORemoteDropHandler);
 
   /* Start server */
   int ret = rpc::RpcServerEnable(FanOut);
@@ -650,7 +672,8 @@ void SEQHandler(void *arg) {
 
   for(int i = 0; i < num_servers; ++i) {
     load_balancer[i] = new rpc::LoadBalancer<payload, PAYLOAD_ID_OFF>(
-			raddr + i, 1, kNumDupClient, nconn[i], LBDropHandler);
+			raddr + i, 1, kNumDupClient, nconn[i],
+			LBLocalDropHandler, LBRemoteDropHandler);
   }
 
   /* Start server */
@@ -690,7 +713,7 @@ std::vector<work_unit> GenerateWork(Arrival a, Service s, double cur_us,
       default:
 	panic("unknown service time distribution");
     }
-    w.emplace_back(work_unit{cur_us, st_us, 0, rand()});
+    w.emplace_back(work_unit{cur_us, st_us, 0, rand(), false});
   }
 
   return w;
@@ -700,8 +723,6 @@ std::vector<work_unit> ClientWorker(
     rpc::RpcClient *c, rt::WaitGroup *starter, rt::WaitGroup *starter2,
     std::function<std::vector<work_unit>()> wf) {
   std::vector<work_unit> w(wf());
-  std::vector<uint64_t> timings;
-  timings.reserve(w.size());
 
   std::vector<rt::Thread> ths;
 
@@ -709,23 +730,18 @@ std::vector<work_unit> ClientWorker(
   for(int i = 0; i < c->NumConns(); ++i) {
     ths.emplace_back(rt::Thread([&, i] {
       payload rp;
-      bool dropped;
 
       while (true) {
-        ssize_t ret = c->Recv(&rp, sizeof(rp), i, &dropped);
+        ssize_t ret = c->Recv(&rp, sizeof(rp), i, (void *)w.data());
         if (ret != static_cast<ssize_t>(sizeof(rp))) {
           if (ret == 0 || ret < 0) break;
           panic("read failed, ret = %ld", ret);
         }
 
-        uint64_t now = microtime();
         uint64_t idx = ntoh64(rp.index);
 
-        w[idx].duration_us = now - timings[idx];
-	w[idx].success = !dropped;
-
-	if (dropped) continue;
-
+        w[idx].duration_us = microtime() - w[idx].timing;
+	w[idx].success = true;
         w[idx].window = c->WinAvail();
         w[idx].tsc = ntoh64(rp.tsc_end);
         w[idx].cpu = ntoh32(rp.cpu);
@@ -762,13 +778,13 @@ std::vector<work_unit> ClientWorker(
         kMaxCatchUpUS)
       continue;
 
-    timings[i] = microtime();
+    w[i].timing = microtime();
 
     // Send an RPC request.
     p.work_iterations = hton64(w[i].work_us * kIterationsPerUS);
     p.index = hton64(i);
     p.hash = w[i].hash;
-    ssize_t ret = c->Send(&p, sizeof(p), w[i].hash, nullptr);
+    ssize_t ret = c->Send(&p, sizeof(p), w[i].hash, (void *)w.data());
     if (ret == -ENOBUFS) continue;
     if (ret != static_cast<ssize_t>(sizeof(p)))
       panic("write failed, ret = %ld", ret);
@@ -783,6 +799,25 @@ std::vector<work_unit> ClientWorker(
   return w;
 }
 
+void ClientLocalDropHandler(struct crpc_ctx *c) {
+  payload *req = reinterpret_cast<payload *>(c->buf);
+  uint64_t idx = ntoh64(req->index);
+  work_unit *w = reinterpret_cast<work_unit *>(c->arg);
+
+  w[idx].duration_us = 0;
+  w[idx].success = false;
+}
+
+void ClientRemoteDropHandler(void *buf, size_t len, void *arg) {
+  assert(len == sizeof(payload));
+  payload *req = (payload *)buf;
+  uint64_t idx = ntoh64(req->index);
+  work_unit *w = reinterpret_cast<work_unit *>(arg);
+
+  w[idx].duration_us = microtime() - w[idx].timing;
+  w[idx].success = false;
+}
+
 std::vector<work_unit> RunExperiment(
     int threads, struct cstat_raw *csr, struct sstat *ss, double *elapsed,
     std::function<std::vector<work_unit>()> wf) {
@@ -795,7 +830,9 @@ std::vector<work_unit> RunExperiment(
   int conn_idx;
 
   for (int i = 0; i < threads; ++i) {
-    std::unique_ptr<rpc::RpcClient> outc(rpc::RpcClient::Dial(raddr[0], i+1, nullptr));
+    std::unique_ptr<rpc::RpcClient> outc(rpc::RpcClient::Dial(raddr[0], i + 1,
+					ClientLocalDropHandler,
+					ClientRemoteDropHandler));
     if (unlikely(outc == nullptr)) panic("couldn't connect to raddr.");
 
     if (nconn[0] > 1) {

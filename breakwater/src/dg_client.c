@@ -234,12 +234,14 @@ ssize_t cdg_send_one(struct crpc_session *s_,
 	return len;
 }
 
-ssize_t cdg_recv_one(struct crpc_conn *cc_, void *buf, size_t len,
-		     bool *dropped)
+ssize_t cdg_recv_one(struct crpc_conn *cc_, void *buf, size_t len, void *arg)
 {
 	struct cdg_conn *cc = (struct cdg_conn *)cc_;
+	struct cdg_session *s = cc->session;
 	struct sdg_hdr shdr;
 	ssize_t ret;
+
+again:
 
 	/* read the server header */
 	ret = tcp_read_full(cc->cmn.c, &shdr, sizeof(shdr));
@@ -273,8 +275,12 @@ ssize_t cdg_recv_one(struct crpc_conn *cc_, void *buf, size_t len,
 		cc->local_prio = shdr.prio;
 		mutex_unlock(&cc->lock);
 
-		if (dropped)
-			*dropped = (shdr.flags & DG_SFLAG_DROP);
+		if (shdr.flags & DG_SFLAG_DROP) {
+			if (s->cmn.rdrop_handler)
+				s->cmn.rdrop_handler(buf, ret, arg);
+			goto again;
+		}
+
 #if CDG_TRACK_FLOW
 		if (s->id == CDG_TRACK_FLOW_ID) {
 			printf("[%lu] ===> response: id=%lu, prio=%d\n",
@@ -292,7 +298,7 @@ ssize_t cdg_recv_one(struct crpc_conn *cc_, void *buf, size_t len,
 }
 
 int cdg_open(struct netaddr raddr, struct crpc_session **sout, int id,
-	     crpc_fn_t drop_handler)
+	     crpc_ldrop_fn_t ldrop_handler, crpc_rdrop_fn_t rdrop_handler)
 {
 	struct netaddr laddr;
 	struct cdg_session *s;

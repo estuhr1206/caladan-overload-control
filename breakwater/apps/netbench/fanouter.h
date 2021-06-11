@@ -67,7 +67,7 @@ public:
   // nclients: number of duplicate clients PER SERVER
   // nconns: number of connections for each server (scale in)
   FanOuter(netaddr *raddrs, int nserver, int nclients, int nconns,
-	       crpc_fn_t drop_handler);
+	       crpc_ldrop_fn_t ldrop_handler, crpc_rdrop_fn_t rdrop_handler);
 
   // Send a request to downstream
   // buf: RPC request buffer
@@ -95,7 +95,8 @@ private:
 
 template <typename T, int ID_OFF>
 FanOuter<T, ID_OFF>::FanOuter(netaddr *raddrs, int nserver,
-			      int nclients, int nconns, crpc_fn_t drop_handler) {
+		int nclients, int nconns, crpc_ldrop_fn_t ldrop_handler,
+		crpc_rdrop_fn_t rdrop_handler) {
   // Initialize member variables
   nclients_ = nclients;
   degree_ = nserver;
@@ -112,7 +113,8 @@ FanOuter<T, ID_OFF>::FanOuter(netaddr *raddrs, int nserver,
     cidx = i % nclients;
 
     // Dial to the first connection
-    clients_[i] = RpcClient::Dial(raddrs[sidx], i+1, drop_handler);
+    clients_[i] = RpcClient::Dial(raddrs[sidx], i + 1, ldrop_handler,
+				  rdrop_handler);
 
     // Add connection
     for (int j = 0; j < nconns - 1; ++j) {
@@ -124,10 +126,9 @@ FanOuter<T, ID_OFF>::FanOuter(netaddr *raddrs, int nserver,
       rt::Thread([&, i, j] {
         T rp;
 	int idx;
-	bool dropped;
 
 	while (true) {
-	  ssize_t ret = clients_[i]->Recv(&rp, sizeof(rp), j, &dropped);
+	  ssize_t ret = clients_[i]->Recv(&rp, sizeof(rp), j, nullptr);
 	  if (ret != static_cast<ssize_t>(sizeof(rp))) {
 	    if (ret == 0 || ret < 0) break;
 	    panic("read response from downstream failed, ret = %ld", ret);
@@ -138,7 +139,7 @@ FanOuter<T, ID_OFF>::FanOuter(netaddr *raddrs, int nserver,
 
 	  // copy response
 	  memcpy(&ctx->resp[idx], &rp, sizeof(rp));
-	  ctx->dropped[idx] = dropped;
+	  ctx->dropped[idx] = false;
 
 	  if (unlikely(ctx->num_resp > ctx->degree))
 	    panic("received more response than the level of degree.");

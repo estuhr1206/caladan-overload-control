@@ -202,8 +202,8 @@ static void crpc_drain_queue(struct cbw_session *s)
 		    now - c->ts <= CBW_MAX_CLIENT_DELAY_US)
 			break;
 
-		if (s->cmn.drop_handler)
-			s->cmn.drop_handler(c);
+		if (s->cmn.ldrop_handler)
+			s->cmn.ldrop_handler(c);
 		s->tail++;
 		s->req_dropped_++;
 #if CBW_TRACK_FLOW
@@ -246,8 +246,8 @@ static bool crpc_enqueue_one(struct cbw_session *s,
 		pos = s->tail % CRPC_QLEN;
 		c = s->qreq[pos];
 
-		if (s->cmn.drop_handler)
-			s->cmn.drop_handler(c);
+		if (s->cmn.ldrop_handler)
+			s->cmn.ldrop_handler(c);
 
 		s->tail++;
 		s->req_dropped_++;
@@ -370,8 +370,7 @@ ssize_t cbw_send_one(struct crpc_session *s_, const void *buf, size_t len,
 	return len;
 }
 
-ssize_t cbw_recv_one(struct crpc_conn *cc_, void *buf, size_t len,
-		     bool *dropped)
+ssize_t cbw_recv_one(struct crpc_conn *cc_, void *buf, size_t len, void *arg)
 {
 	struct cbw_conn *cc = (struct cbw_conn *)cc_;
 	struct cbw_session *s = cc->session;
@@ -426,10 +425,13 @@ again:
 			crpc_drain_queue(s);
 		}
 
-		if (dropped)
-			*dropped = (shdr.flags & BW_SFLAG_DROP);
-
 		mutex_unlock(&s->lock);
+
+		if (shdr.flags & BW_SFLAG_DROP) {
+			if (s->cmn.rdrop_handler)
+				s->cmn.rdrop_handler(buf, ret, arg);
+			goto again;
+		}
 
 		break;
 	case BW_OP_WINUPDATE:
@@ -493,8 +495,8 @@ static void crpc_timer(void *arg)
 				break;
 
 			// handle drop
-			if (s->cmn.drop_handler)
-				s->cmn.drop_handler(c);
+			if (s->cmn.ldrop_handler)
+				s->cmn.ldrop_handler(c);
 
 			// update stats
 			s->tail++;
@@ -532,7 +534,7 @@ done:
 }
 
 int cbw_open(struct netaddr raddr, struct crpc_session **sout, int id,
-	     crpc_fn_t drop_handler)
+	     crpc_ldrop_fn_t ldrop_handler, crpc_rdrop_fn_t rdrop_handler)
 {
 	struct netaddr laddr;
 	struct cbw_session *s;
@@ -580,7 +582,8 @@ int cbw_open(struct netaddr raddr, struct crpc_session **sout, int id,
 	/* init session */
 	s->cmn.nconns = 1;
 	s->cmn.c[0] = (struct crpc_conn *)cc;
-	s->cmn.drop_handler = drop_handler;
+	s->cmn.ldrop_handler = ldrop_handler;
+	s->cmn.rdrop_handler = rdrop_handler;
 	s->running = true;
 	s->demand_sync = false;
 	s->id = id;

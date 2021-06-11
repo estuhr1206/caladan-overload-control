@@ -131,8 +131,7 @@ ssize_t cnc_send_one(struct crpc_session *s_,
 	return ret;
 }
 
-ssize_t cnc_recv_one(struct crpc_conn *cc_, void *buf, size_t len,
-		     bool *dropped)
+ssize_t cnc_recv_one(struct crpc_conn *cc_, void *buf, size_t len, void *arg)
 {
 	struct cnc_conn *cc = (struct cnc_conn *)cc_;
 	struct snc_hdr shdr;
@@ -168,9 +167,6 @@ again:
 		assert(ret == shdr.len);
 		cc->resp_rx_++;
 
-		if (dropped)
-			*dropped = false;
-
 #if CNC_TRACK_FLOW
 		if (cc->session->id == CNC_TRACK_FLOW_ID) {
 			printf("[%lu] ===> response: id=%lu\n",
@@ -187,7 +183,7 @@ again:
 }
 
 int cnc_open(struct netaddr raddr, struct crpc_session **sout, int id,
-	     crpc_fn_t drop_handler)
+	     crpc_ldrop_fn_t ldrop_handler, crpc_rdrop_fn_t rdrop_handler)
 {
 	struct netaddr laddr;
 	struct cnc_session *s;

@@ -48,7 +48,7 @@ public:
   // nclients: number of duplicate clients (scale out)
   // nconns: number of connections for each server (scale in)
   LoadBalancer(netaddr *raddrs, int nserver, int nclients, int nconns,
-	       crpc_fn_t drop_handler);
+	       crpc_ldrop_fn_t ldrop_handler, crpc_rdrop_fn_t rdrop_handler);
 
   // Send a request to downstream
   // buf: RPC request buffer
@@ -74,7 +74,8 @@ private:
 
 template <typename T, int ID_OFF>
 LoadBalancer<T, ID_OFF>::LoadBalancer(netaddr *raddrs, int nserver,
-			int nclients, int nconns, crpc_fn_t drop_handler) {
+			int nclients, int nconns, crpc_ldrop_fn_t ldrop_handler,
+			crpc_rdrop_fn_t rdrop_handler) {
   // Initialize member variables
   nclients_ = nclients;
   next_cidx_ = 0;
@@ -84,7 +85,7 @@ LoadBalancer<T, ID_OFF>::LoadBalancer(netaddr *raddrs, int nserver,
   for (int i = 0; i < nclients; ++i) {
     // Dial to the first connection (Note Dial returns a new Client)
     // TODO: DropHandler
-    clients_[i] = RpcClient::Dial(raddrs[0], 1, drop_handler);
+    clients_[i] = RpcClient::Dial(raddrs[0], 1, ldrop_handler, rdrop_handler);
 
     // Add connections to the replicas
     if (nconns > 1) {
@@ -107,10 +108,9 @@ LoadBalancer<T, ID_OFF>::LoadBalancer(netaddr *raddrs, int nserver,
     for(int j = 0; j < clients_[i]->NumConns(); ++j) {
       rt::Thread([&, i, j] {
         T rp;
-	bool dropped;
 
 	while (true) {
-	  ssize_t ret = clients_[i]->Recv(&rp, sizeof(rp), j, &dropped);
+	  ssize_t ret = clients_[i]->Recv(&rp, sizeof(rp), j, nullptr);
 	  if (ret != static_cast<ssize_t>(sizeof(rp))) {
 	    if (ret == 0 || ret < 0) break;
 	    panic("read response from downstream failed, ret = %ld", ret);
@@ -119,7 +119,7 @@ LoadBalancer<T, ID_OFF>::LoadBalancer(netaddr *raddrs, int nserver,
 	  LBCTX<T> *ctx = GetCTX((char *)&rp);
 	  // copy response
 	  memcpy(&ctx->resp, &rp, sizeof(rp));
-	  ctx->dropped = dropped;
+	  ctx->dropped = false;
 
 	  // wake up the waiter
 	  ctx->waiter->Done();

@@ -22,16 +22,18 @@ class RpcClient {
 
   // Creates an RPC session.
   static RpcClient *Dial(netaddr raddr, int id,
-			 crpc_fn_t drop_handler);
+			 crpc_ldrop_fn_t ldrop_handler,
+			 crpc_rdrop_fn_t rdrop_handler);
 
   int AddConnection(netaddr raddr);
 
   // Sends an RPC request.
-  ssize_t Send(const void *buf, size_t len, int hash, void *arg);
+  ssize_t Send(const void *buf, size_t len, int hash,
+	       void *arg = nullptr);
 
   // Receives an RPC request.
   ssize_t Recv(void *buf, size_t len, int conn_idx = 0,
-	       bool *dropped = nullptr);
+	       void *arg = nullptr);
 
   int NumConns();
 

@@ -13,10 +13,12 @@ void RpcServerTrampoline(struct srpc_ctx *arg) {
 } // namespace
 
 RpcClient *RpcClient::Dial(netaddr raddr, int id,
-			   crpc_fn_t drop_handler) {
+			   crpc_ldrop_fn_t ldrop_handler,
+			   crpc_rdrop_fn_t rdrop_handler) {
   crpc_session *s;
   raddr.port = SRPC_PORT;
-  int ret = crpc_ops->crpc_open(raddr, &s, id, drop_handler);
+  int ret = crpc_ops->crpc_open(raddr, &s, id, ldrop_handler,
+				rdrop_handler);
   if (ret) return nullptr;
   return new RpcClient(s);
 }
@@ -30,9 +32,8 @@ ssize_t RpcClient::Send(const void *buf, size_t len, int hash, void *arg) {
   return crpc_ops->crpc_send_one(s_, buf, len, hash, arg);
 }
 
-ssize_t RpcClient::Recv(void *buf, size_t len, int conn_idx,
-			bool *dropped) {
-  return crpc_ops->crpc_recv_one(s_->c[conn_idx], buf, len, dropped);
+ssize_t RpcClient::Recv(void *buf, size_t len, int conn_idx, void *arg) {
+  return crpc_ops->crpc_recv_one(s_->c[conn_idx], buf, len, arg);
 }
 
 int RpcClient::NumConns() {
