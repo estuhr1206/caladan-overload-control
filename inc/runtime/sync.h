@@ -92,6 +92,8 @@ struct condvar {
 typedef struct condvar condvar_t;
 
 extern void condvar_wait(condvar_t *cv, mutex_t *m);
+extern void condvar_timed_wait(condvar_t *cv, mutex_t *m,
+			       uint64_t timeout_us);
 extern void condvar_signal(condvar_t *cv);
 extern void condvar_broadcast(condvar_t *cv);
 extern void condvar_init(condvar_t *cv);

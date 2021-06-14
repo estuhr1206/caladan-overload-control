@@ -6,6 +6,7 @@
 #include <base/log.h>
 #include <runtime/thread.h>
 #include <runtime/sync.h>
+#include <runtime/timer.h>
 
 #include "defs.h"
 
@@ -222,6 +223,59 @@ void condvar_wait(condvar_t *cv, mutex_t *m)
 	thread_park_and_unlock_np(&cv->waiter_lock);
 
 	mutex_lock(m);
+}
+
+struct condvar_timed_wait_args {
+	thread_t *th;
+	condvar_t *cv;
+};
+
+static void condvar_timed_wait_expired(unsigned long args) {
+	struct condvar_timed_wait_args *t_args =
+		(struct condvar_timed_wait_args *)args;
+	thread_t *th = t_args->th;
+	condvar_t *cv = t_args->cv;
+	thread_t *waiter;
+
+	// see if still th is in the waiter lists
+	spin_lock_np(&cv->waiter_lock);
+	list_for_each(&cv->waiters, waiter, link) {
+		if (waiter == th) {
+			list_del(&waiter->link);
+			break;
+		}
+	}
+	spin_unlock_np(&cv->waiter_lock);
+
+	if (waiter == th)
+		thread_ready(th);
+}
+
+/**
+ * condvar_timed_wait - waits for a condition variable to be signalled
+ * or for a timer to be expired.
+ * @cv: the condition variable to wait for
+ * @m: the currently held mutex that projects the condition
+ * @timeout_us: amount time to wait for
+ */
+void condvar_timed_wait(condvar_t *cv, mutex_t *m, uint64_t timeout_us)
+{
+	struct kthread *k;
+	struct timer_entry e;
+	struct condvar_timed_wait_args args = {thread_self(), cv};
+	uint64_t deadline_us = microtime() + timeout_us;
+
+	assert_mutex_held(m);
+
+	// schedule timer
+	timer_init(&e, condvar_timed_wait_expired, (unsigned long)&args);
+	timer_start(&e, deadline_us);
+
+	// wait for signal
+	condvar_wait(cv, m);
+
+	// cancel timer
+	timer_cancel(&e);
 }
 
 /**

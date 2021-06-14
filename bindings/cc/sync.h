@@ -237,6 +237,10 @@ class CondVar {
   // after wakeup, as no guarantees are made about preventing spurious wakeups.
   void Wait(Mutex *mu) { condvar_wait(&cv_, &mu->mu_); }
 
+  void TimedWait(Mutex *mu, uint64_t timeout_us) {
+    condvar_timed_wait(&cv_, &mu->mu_, timeout_us);
+  }
+
   // Wake up one waiter.
   void Signal() { condvar_signal(&cv_); }
 
