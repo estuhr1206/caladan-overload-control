@@ -418,6 +418,91 @@ static void srpc_remove_from_drained_list(struct sbw_session *s)
 	s->drained_core = -1;
 }
 
+/* decr_credit_pool: return decreased credit pool size with congestion control
+ *
+ * @ qus: queueing delay in us
+ * */
+static int decr_credit_pool (uint64_t qus)
+{
+	float alpha;
+	int credit_pool = atomic_read(&srpc_credit_pool);
+
+	alpha = (qus - SBW_MIN_DELAY_US) / (float)SBW_MIN_DELAY_US;
+	alpha = alpha * SBW_MD;
+	alpha = MAX(1.0 - alpha, 0.5);
+
+	credit_pool = (int)(credit_pool * alpha);
+	credit_carry = 0.0;
+
+	credit_pool = MAX(credit_pool, runtime_max_cores());
+	credit_pool = MIN(credit_pool, atomic_read(&srpc_num_sess) << SBW_MAX_WINDOW_EXP);
+
+	return credit_pool;
+}
+
+/* incr_credit_pool: return increased credit pool size with congestion control
+ *
+ * @ qus: queueing delay in us
+ * */
+static int incr_credit_pool (uint64_t qus)
+{
+	int credit_pool = atomic_read(&srpc_credit_pool);
+	int num_sess = atomic_read(&srpc_num_sess);
+
+	credit_carry += num_sess * SBW_AI;
+	if (credit_carry >= 1.0) {
+		int new_credit_int = (int)credit_carry;
+		credit_pool += new_credit_int;
+		credit_carry -= new_credit_int;
+	}
+
+	credit_pool = MAX(credit_pool, runtime_max_cores());
+	credit_pool = MIN(credit_pool, num_sess << SBW_MAX_WINDOW_EXP);
+
+	return credit_pool;
+}
+
+/* wakeup_drained_session: wakes up drained session which will send explicit
+ * credit if there is available credit in credit pool
+ *
+ * @num_session: the number of sessions to wake up
+ * */
+static void wakeup_drained_session(int num_session)
+{
+	unsigned int i;
+	unsigned int core_id = get_current_affinity();
+	unsigned int max_cores = runtime_max_cores();
+	struct sbw_session *ws;
+	thread_t *th;
+
+	while (num_session > 0) {
+		ws = srpc_choose_drained_session(core_id);
+
+		i = (core_id + 1) % max_cores;
+		while (!ws && i != core_id) {
+			ws = srpc_choose_drained_session(i);
+			i = (i + 1) % max_cores;
+		}
+
+		if (!ws)
+			break;
+
+		spin_lock_np(&ws->lock);
+		BUG_ON(ws->credit > 0);
+		th = ws->sender_th;
+		ws->sender_th = NULL;
+		ws->wake_up = true;
+		ws->credit = 1;
+		spin_unlock_np(&ws->lock);
+
+		atomic_inc(&srpc_credit_used);
+
+		if (th)
+			thread_ready(th);
+		num_session--;
+	}
+}
+
 static void srpc_worker(void *arg)
 {
 	struct sbw_ctx *c = (struct sbw_ctx *)arg;
@@ -811,75 +896,24 @@ static void srpc_server(void *arg)
 static void srpc_cc_worker(void *arg)
 {
 	uint64_t us;
-	float alpha;
 	int new_cp;
 	int credit_used;
 	int credit_unused;
-	int num_sess;
-	struct sbw_session *ds;
-	unsigned int max_cores = runtime_max_cores();
-	unsigned int core_id, i;
-	thread_t *th;
 
 	while (true) {
 		timer_sleep(SBW_RTT_US);
 		us = runtime_queue_us();
-		new_cp = atomic_read(&srpc_credit_pool);
-		num_sess = atomic_read(&srpc_num_sess);
-		credit_used = atomic_read(&srpc_credit_used);
 
-		if (us >= SBW_MIN_DELAY_US) {
-			// reducing credit pool
-			alpha = (us - SBW_MIN_DELAY_US) / (float)SBW_MIN_DELAY_US;
-			alpha = alpha * SBW_MD;
-			alpha = MAX(1.0 - alpha, 0.5);
-
-			new_cp = (int)(new_cp * alpha);
-			credit_carry = 0.0;
-		} else if (new_cp <= credit_used) {
-			// increase credit pool when the server used up all
-			credit_carry += num_sess * SBW_AI;
-			if (credit_carry >= 1.0) {
-				int new_credit_int = (int)credit_carry;
-				new_cp += new_credit_int;
-				credit_carry -= new_credit_int;
-			}
-		}
-
-		new_cp = MAX(new_cp, max_cores);
-		new_cp = MIN(new_cp, atomic_read(&srpc_num_sess) << SBW_MAX_WINDOW_EXP);
+		if (us >= SBW_MIN_DELAY_US)
+			new_cp = decr_credit_pool(us);
+		else
+			new_cp = incr_credit_pool(us);
 
 		// Wake up threads from drained list
+		credit_used = atomic_read(&srpc_credit_used);
 		credit_unused = new_cp - credit_used;
-		core_id = get_current_affinity();
 
-		while (credit_unused > 0) {
-			ds = srpc_choose_drained_session(core_id);
-
-			i = (core_id + 1) % max_cores;
-			while (!ds && i != core_id) {
-				ds = srpc_choose_drained_session(i);
-				i = (i + 1) % max_cores;
-			}
-
-			if (!ds)
-				break;
-
-			spin_lock_np(&ds->lock);
-			BUG_ON(ds->credit > 0);
-			th = ds->sender_th;
-			ds->sender_th = NULL;
-			ds->wake_up = true;
-			ds->credit = 1;
-			spin_unlock_np(&ds->lock);
-
-			atomic_inc(&srpc_credit_used);
-
-			if (th)
-				thread_ready(th);
-			credit_unused--;
-		}
-
+		wakeup_drained_session(credit_unused);
 		atomic_write(&srpc_credit_pool, new_cp);
 
 #if SBW_TS_OUT
