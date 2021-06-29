@@ -226,7 +226,6 @@ static int srpc_send_ecredit(struct sbw_session *s)
 		return ret;
 
 	atomic64_inc(&srpc_stat_ecredit_tx_);
-	atomic64_fetch_and_add(&srpc_stat_credit_tx_, shdr.credit);
 
 #if SBW_TRACK_FLOW
 	if (s->id == SBW_TRACK_FLOW_ID) {
@@ -297,7 +296,6 @@ static int srpc_send_completion_vector(struct sbw_session *s,
 #endif
 	atomic_sub_and_fetch(&srpc_num_pending, nrhdr);
 	atomic64_fetch_and_add(&srpc_stat_resp_tx_, nrhdr);
-	atomic64_fetch_and_add(&srpc_stat_credit_tx_, s->credit * nrhdr);
 
 	if (unlikely(ret < 0))
 		return ret;
@@ -609,7 +607,9 @@ static void srpc_sender(void *arg)
 	unsigned int core_id;
 	bool send_explicit_credit;
 	int drained_core;
+	int old_credit;
 	int credit;
+	int credit_issued;
 	bool req_dropped;
 
 	while (true) {
@@ -649,9 +649,12 @@ static void srpc_sender(void *arg)
 		drained_core = s->drained_core;
 		num_resp = bitmap_popcount(tmp, SBW_MAX_WINDOW);
 		s->num_pending -= num_resp;
+		old_credit = s->credit;
 		srpc_update_credit(s, req_dropped);
-
 		credit = s->credit;
+
+		credit_issued = MAX(0, credit - old_credit + num_resp);
+		atomic64_fetch_and_add(&srpc_stat_credit_tx_, credit_issued);
 
 		send_explicit_credit = (s->need_ecredit || s->wake_up) &&
 			num_resp == 0 && s->advertised < s->credit;
