@@ -40,20 +40,20 @@ int RpcClient::NumConns() {
   return s_->nconns;
 }
 
-uint32_t RpcClient::WinAvail() {
-  return crpc_ops->crpc_win_avail(s_);
+uint32_t RpcClient::Credit() {
+  return crpc_ops->crpc_credit(s_);
 }
 
 void RpcClient::StatClear() {
   return crpc_ops->crpc_stat_clear(s_);
 }
 
-uint64_t RpcClient::StatWinuRx() {
-  return crpc_ops->crpc_stat_winu_rx(s_);
+uint64_t RpcClient::StatEcreditRx() {
+  return crpc_ops->crpc_stat_ecredit_rx(s_);
 }
 
-uint64_t RpcClient::StatWinuTx() {
-  return crpc_ops->crpc_stat_winu_tx(s_);
+uint64_t RpcClient::StatCupdateTx() {
+  return crpc_ops->crpc_stat_cupdate_tx(s_);
 }
 
 uint64_t RpcClient::StatRespRx() {
@@ -64,8 +64,8 @@ uint64_t RpcClient::StatReqTx() {
   return crpc_ops->crpc_stat_req_tx(s_);
 }
 
-uint64_t RpcClient::StatWinExpired() {
-  return crpc_ops->crpc_stat_win_expired(s_);
+uint64_t RpcClient::StatCreditExpired() {
+  return crpc_ops->crpc_stat_credit_expired(s_);
 }
 
 uint64_t RpcClient::StatReqDropped() {
@@ -99,16 +99,16 @@ int RpcServerEnable(std::function<void(struct srpc_ctx *)> f) {
   return ret;
 }
 
-uint64_t RpcServerStatWinuRx() {
-  return srpc_ops->srpc_stat_winu_rx();
+uint64_t RpcServerStatCupdateRx() {
+  return srpc_ops->srpc_stat_cupdate_rx();
 }
 
-uint64_t RpcServerStatWinuTx() {
-  return srpc_ops->srpc_stat_winu_tx();
+uint64_t RpcServerStatEcreditTx() {
+  return srpc_ops->srpc_stat_ecredit_tx();
 }
 
-uint64_t RpcServerStatWinTx() {
-  return srpc_ops->srpc_stat_win_tx();
+uint64_t RpcServerStatCreditTx() {
+  return srpc_ops->srpc_stat_credit_tx();
 }
 
 uint64_t RpcServerStatReqRx() {

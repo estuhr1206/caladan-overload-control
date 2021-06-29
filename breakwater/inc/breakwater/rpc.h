@@ -31,7 +31,7 @@ struct srpc_ctx {
 	char			req_buf[SRPC_BUF_SIZE];
 	char			resp_buf[SRPC_BUF_SIZE];
 	bool			drop;
-	uint64_t		ds_win;
+	uint64_t		ds_credit;
 };
 
 typedef void (*srpc_fn_t)(struct srpc_ctx *ctx);
@@ -45,9 +45,9 @@ struct srpc_ops {
 	 */
 	int (*srpc_enable)(srpc_fn_t handler);
 
-	uint64_t (*srpc_stat_winu_rx)();
-	uint64_t (*srpc_stat_winu_tx)();
-	uint64_t (*srpc_stat_win_tx)();
+	uint64_t (*srpc_stat_cupdate_rx)();
+	uint64_t (*srpc_stat_ecredit_tx)();
+	uint64_t (*srpc_stat_credit_tx)();
 	uint64_t (*srpc_stat_req_rx)();
 	uint64_t (*srpc_stat_req_dropped)();
 	uint64_t (*srpc_stat_resp_tx)();
@@ -143,11 +143,11 @@ struct crpc_ops {
 	 */
 	void (*crpc_close)(struct crpc_session *s);
 
-	uint32_t (*crpc_win_avail)(struct crpc_session *s);
+	uint32_t (*crpc_credit)(struct crpc_session *s);
 	void (*crpc_stat_clear)(struct crpc_session *s);
-	uint64_t (*crpc_stat_winu_rx)(struct crpc_session *s);
-	uint64_t (*crpc_stat_win_expired)(struct crpc_session *s);
-	uint64_t (*crpc_stat_winu_tx)(struct crpc_session *s);
+	uint64_t (*crpc_stat_ecredit_rx)(struct crpc_session *s);
+	uint64_t (*crpc_stat_credit_expired)(struct crpc_session *s);
+	uint64_t (*crpc_stat_cupdate_tx)(struct crpc_session *s);
 	uint64_t (*crpc_stat_resp_rx)(struct crpc_session *s);
 	uint64_t (*crpc_stat_req_tx)(struct crpc_session *s);
 	uint64_t (*crpc_stat_req_dropped)(struct crpc_session *s);

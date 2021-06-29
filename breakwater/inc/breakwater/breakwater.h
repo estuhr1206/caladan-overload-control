@@ -25,16 +25,16 @@ struct cbw_conn {
 	struct cbw_session	*session;
 
 	/* credit-related variables */
-	bool			waiting_winupdate;
-	uint32_t		win_avail;
-	uint32_t		win_used;
+	bool			waiting_resp;
+	uint32_t		credit;
+	uint32_t		credit_used;
 
 	/* per-connection stats */
-	uint64_t		winu_rx_;
-	uint64_t		winu_tx_;
+	uint64_t		ecredit_rx_;
+	uint64_t		cupdate_tx_;
 	uint64_t		resp_rx_;
 	uint64_t		req_tx_;
-	uint64_t		win_expired_;
+	uint64_t		credit_expired_;
 };
 
 /* for RPC client */

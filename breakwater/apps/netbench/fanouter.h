@@ -77,7 +77,7 @@ public:
   FOCTX<T> *Send(const void *buf, size_t len, int hash);
 
   // Returns downstream window size
-  uint32_t WinAvail();
+  uint32_t Credit();
 
   // Convert request/response buffer to FOCTX
   static FOCTX<T> *GetCTX(char *buf);
@@ -170,7 +170,7 @@ FOCTX<T> *FanOuter<T, ID_OFF>::Send(const void *buf, size_t len, int hash) {
     int idx = next_cidx_[i];
 
     for (int j = 0; j < nclients_; ++j) {
-      if (clients_[nclients_*i + idx]->WinAvail() > 0) break;
+      if (clients_[nclients_*i + idx]->Credit() > 0) break;
       idx = (idx + 1) % nclients_;
     }
 
@@ -183,24 +183,24 @@ FOCTX<T> *FanOuter<T, ID_OFF>::Send(const void *buf, size_t len, int hash) {
   return ctx;
 }
 
-// WinAvail(): Returns downstream available window size
+// Credit(): Returns downstream credit
 // TODO: Better to optimize this function. Instaed of sum of windows
 // over the loop, we can maintain a single atomic variable.
 template <typename T, int ID_OFF>
-uint32_t FanOuter<T, ID_OFF>::WinAvail() {
+uint32_t FanOuter<T, ID_OFF>::Credit() {
   uint32_t ds_win = 0;
   uint32_t win;
 
   // Window of the first server
   for (int i = 0; i < nclients_; ++i) {
-    ds_win += clients_[i]->WinAvail();
+    ds_win += clients_[i]->Credit();
   }
 
   // Window of n-th server (n >= 2)
   for (int i = 1; i < degree_; ++i) {
     win = 0;
     for (int j = 0; j < nclients_; ++j) {
-      win += clients_[i*nclients_ + j]->WinAvail();
+      win += clients_[i*nclients_ + j]->Credit();
     }
     ds_win = MIN(ds_win, win);
   }

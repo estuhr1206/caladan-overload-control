@@ -252,7 +252,7 @@ void cnc_close(struct crpc_session *s_)
 }
 
 /* client stats */
-uint32_t cnc_win_avail(struct crpc_session *s_)
+uint32_t cnc_credit(struct crpc_session *s_)
 {
 	return 0;
 }
@@ -262,17 +262,17 @@ void cnc_stat_clear(struct crpc_session *s_)
 	return;
 }
 
-uint64_t cnc_stat_win_expired(struct crpc_session *s_)
+uint64_t cnc_stat_credit_expired(struct crpc_session *s_)
 {
 	return 0;
 }
 
-uint64_t cnc_stat_winu_rx(struct crpc_session *s_)
+uint64_t cnc_stat_ecredit_rx(struct crpc_session *s_)
 {
 	return 0;
 }
 
-uint64_t cnc_stat_winu_tx(struct crpc_session *s_)
+uint64_t cnc_stat_cupdate_tx(struct crpc_session *s_)
 {
 	return 0;
 }
@@ -319,17 +319,17 @@ uint64_t cnc_stat_req_dropped(struct crpc_session *s_)
 }
 
 struct crpc_ops cnc_ops = {
-	.crpc_add_connection	= cnc_add_connection,
-	.crpc_send_one		= cnc_send_one,
-	.crpc_recv_one		= cnc_recv_one,
-	.crpc_open		= cnc_open,
-	.crpc_close		= cnc_close,
-	.crpc_win_avail		= cnc_win_avail,
-	.crpc_stat_clear	= cnc_stat_clear,
-	.crpc_stat_winu_rx	= cnc_stat_winu_rx,
-	.crpc_stat_win_expired	= cnc_stat_win_expired,
-	.crpc_stat_winu_tx	= cnc_stat_winu_tx,
-	.crpc_stat_resp_rx	= cnc_sess_stat_resp_rx,
-	.crpc_stat_req_tx	= cnc_sess_stat_req_tx,
-	.crpc_stat_req_dropped	= cnc_stat_req_dropped,
+	.crpc_add_connection		= cnc_add_connection,
+	.crpc_send_one			= cnc_send_one,
+	.crpc_recv_one			= cnc_recv_one,
+	.crpc_open			= cnc_open,
+	.crpc_close			= cnc_close,
+	.crpc_credit			= cnc_credit,
+	.crpc_stat_clear		= cnc_stat_clear,
+	.crpc_stat_ecredit_rx		= cnc_stat_ecredit_rx,
+	.crpc_stat_credit_expired	= cnc_stat_credit_expired,
+	.crpc_stat_cupdate_tx		= cnc_stat_cupdate_tx,
+	.crpc_stat_resp_rx		= cnc_sess_stat_resp_rx,
+	.crpc_stat_req_tx		= cnc_sess_stat_req_tx,
+	.crpc_stat_req_dropped		= cnc_stat_req_dropped,
 };

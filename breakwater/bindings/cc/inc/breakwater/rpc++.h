@@ -37,19 +37,19 @@ class RpcClient {
 
   int NumConns();
 
-  uint32_t WinAvail();
+  uint32_t Credit();
 
   void StatClear();
 
-  uint64_t StatWinuRx();
+  uint64_t StatEcreditRx();
 
-  uint64_t StatWinuTx();
+  uint64_t StatCupdateTx();
 
   uint64_t StatRespRx();
 
   uint64_t StatReqTx();
 
-  uint64_t StatWinExpired();
+  uint64_t StatCreditExpired();
 
   uint64_t StatReqDropped();
 
@@ -71,9 +71,9 @@ class RpcClient {
 // Can only be called once.
 int RpcServerEnable(std::function<void(struct srpc_ctx *)> f);
 
-uint64_t RpcServerStatWinuRx();
-uint64_t RpcServerStatWinuTx();
-uint64_t RpcServerStatWinTx();
+uint64_t RpcServerStatCupdateRx();
+uint64_t RpcServerStatEcreditTx();
+uint64_t RpcServerStatCreditTx();
 uint64_t RpcServerStatReqRx();
 uint64_t RpcServerStatReqDropped();
 uint64_t RpcServerStatRespTx();

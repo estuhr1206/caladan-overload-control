@@ -10,8 +10,8 @@
 #define BW_RESP_MAGIC	0x73727063 /* 'srpc' */
 
 enum {
-	BW_OP_CALL = 0,  /* performs a procedure call */
-	BW_OP_WINUPDATE, /* just updates the window (no call) */
+	BW_OP_CALL = 0,   /* performs a procedure call */
+	BW_OP_CREDIT,     /* just updates the credit (no call) */
 	BW_OP_MAX,	  /* maximum number of opcodes */
 };
 
@@ -36,7 +36,7 @@ struct sbw_hdr {
 	uint32_t	op;    /* the opcode */
 	size_t		len;   /* length of response in bytes */
 	uint64_t	id;    /* Request / Response ID */
-	uint64_t	win;   /* the offered window size */
+	uint64_t	credit;   /* the offered window size */
 	uint64_t	ts_sent;
 	uint8_t		flags;
 };

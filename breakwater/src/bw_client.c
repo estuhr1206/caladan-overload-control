@@ -21,12 +21,12 @@
 #define CBW_TRACK_FLOW_ID		1
 
 /**
- * crpc_send_winupdate - send WINUPDATE message to update window size
- * @s: the RPC session to update the window
+ * crpc_send_cupdate - send CREDIT message to update credit
+ * @s: the RPC session to update the credit
  *
  * On success, returns 0. On failure returns standard socket errors (< 0)
  */
-static ssize_t crpc_send_winupdate(struct cbw_conn *cc)
+static ssize_t crpc_send_cupdate(struct cbw_conn *cc)
 {
 	struct cbw_session *s = cc->session;
         struct cbw_hdr chdr;
@@ -36,7 +36,7 @@ static ssize_t crpc_send_winupdate(struct cbw_conn *cc)
 
 	/* construct the client header */
 	chdr.magic = BW_REQ_MAGIC;
-	chdr.op = BW_OP_WINUPDATE;
+	chdr.op = BW_OP_CREDIT;
 	chdr.id = 0;
 	chdr.len = 0;
 	chdr.demand = s->head - s->tail;
@@ -50,12 +50,12 @@ static ssize_t crpc_send_winupdate(struct cbw_conn *cc)
 		return ret;
 
 	assert(ret == sizeof(chdr));
-	cc->winu_tx_++;
+	cc->cupdate_tx_++;
 
 #if CBW_TRACK_FLOW
 	if (cc->session->id == CBW_TRACK_FLOW_ID) {
-		printf("[%lu] <=== winupdate: demand = %lu, win = %u/%u\n",
-		       microtime(), chdr.demand, cc->win_used, cc->win_avail);
+		printf("[%lu] <=== credit_update: demand = %lu, credit = %u/%u\n",
+		       microtime(), chdr.demand, cc->credit_used, cc->credit);
 	}
 #endif
 	return 0;
@@ -74,11 +74,11 @@ static ssize_t crpc_send_request_vector(struct cbw_conn *cc)
 	assert_mutex_held(&s->lock);
 
 	/* queue is empty or no available credits */
-	if (s->head == s->tail || cc->win_used >= cc->win_avail)
+	if (s->head == s->tail || cc->credit_used >= cc->credit)
 		return 0;
 
 	/* while queue is not empty and there is available credits */
-	while (s->head != s->tail && cc->win_used < cc->win_avail) {
+	while (s->head != s->tail && cc->credit_used < cc->credit) {
 		struct crpc_ctx *c = s->qreq[s->tail++ % CRPC_QLEN];
 
 		chdr[nrhdr].magic = BW_REQ_MAGIC;
@@ -101,7 +101,7 @@ static ssize_t crpc_send_request_vector(struct cbw_conn *cc)
 			vec[nriov++].iov_len = c->len;
 		}
 
-		cc->win_used++;
+		cc->credit_used++;
 	}
 
 	if (s->head == s->tail) {
@@ -115,8 +115,8 @@ static ssize_t crpc_send_request_vector(struct cbw_conn *cc)
 
 #if CBW_TRACK_FLOW
 	if (s->id == CBW_TRACK_FLOW_ID) {
-		printf("[%lu] <=== request (%d): qlen=%d win=%d/%d\n",
-		       microtime(), nrhdr, s->head-s->tail, cc->win_used, cc->win_avail);
+		printf("[%lu] <=== request (%d): qlen=%d credit=%d/%d\n",
+		       microtime(), nrhdr, s->head-s->tail, cc->credit_used, cc->credit);
 	}
 #endif
 
@@ -163,8 +163,8 @@ static ssize_t crpc_send_raw(struct cbw_conn *cc,
 
 #if CBW_TRACK_FLOW
 	if (s->id == CBW_TRACK_FLOW_ID) {
-		printf("[%lu] <=== request: id=%lu, demand = %lu, win = %u/%u\n",
-		       now, chdr.id, chdr.demand, cc->win_used, cc->win_avail);
+		printf("[%lu] <=== request: id=%lu, demand = %lu, credit = %u/%u\n",
+		       now, chdr.id, chdr.demand, cc->credit_used, cc->credit);
 	}
 #endif
 	return len;
@@ -222,8 +222,8 @@ static void crpc_drain_queue(struct cbw_session *s)
 		/* (1) not waiting for the first response
 		 * (2) have available credit
 		 */
-		if (!cc->waiting_winupdate &&
-		    cc->win_used < cc->win_avail) {
+		if (!cc->waiting_resp &&
+		    cc->credit_used < cc->credit) {
 			crpc_send_request_vector(cc);
 			s->next_conn_idx = (conn_idx + 1) % s->cmn.nconns;
 			break;
@@ -278,8 +278,8 @@ static bool crpc_enqueue_one(struct cbw_session *s,
 	if (!s->init) {
 		for(int i = 0; i < s->cmn.nconns; ++i) {
 			cc = (struct cbw_conn *)s->cmn.c[i];
-			crpc_send_winupdate(cc);
-			cc->waiting_winupdate = true;
+			crpc_send_cupdate(cc);
+			cc->waiting_resp = true;
 		}
 		s->init = true;
 	}
@@ -350,8 +350,8 @@ ssize_t cbw_send_one(struct crpc_session *s_, const void *buf, size_t len,
 
 	/* hot path, just send */
 	cc = (struct cbw_conn *)s->cmn.c[s->next_conn_idx];
-	if (cc->win_used < cc->win_avail && s->head == s->tail) {
-		cc->win_used++;
+	if (cc->credit_used < cc->credit && s->head == s->tail) {
+		cc->credit_used++;
 		ret = crpc_send_raw(cc, buf, len, s->req_id++);
 		s->next_conn_idx = (s->next_conn_idx + 1) % s->cmn.nconns;
 		mutex_unlock(&s->lock);
@@ -407,21 +407,21 @@ again:
 				cc->resp_rx_++;
 		}
 
-		/* update the window */
+		/* update the credit */
 		mutex_lock(&s->lock);
-		assert(cc->win_used > 0);
-		cc->win_used--;
-		cc->win_avail = shdr.win;
-		cc->waiting_winupdate = false;
+		assert(cc->credit_used > 0);
+		cc->credit_used--;
+		cc->credit = shdr.credit;
+		cc->waiting_resp = false;
 
 #if CBW_TRACK_FLOW
 		if (s->id == CBW_TRACK_FLOW_ID) {
-			printf("[%lu] ===> response: id=%lu, shdr.win=%lu, win=%u/%u\n",
-			       microtime(), shdr.id, shdr.win, cc->win_used, cc->win_avail);
+			printf("[%lu] ===> response: id=%lu, shdr.credit=%lu, credit=%u/%u\n",
+			       microtime(), shdr.id, shdr.credit, cc->credit_used, cc->credit);
 		}
 #endif
 
-		if (cc->win_avail > 0) {
+		if (cc->credit > 0) {
 			crpc_drain_queue(s);
 		}
 
@@ -434,30 +434,30 @@ again:
 		}
 
 		break;
-	case BW_OP_WINUPDATE:
+	case BW_OP_CREDIT:
 		if (unlikely(shdr.len != 0)) {
 			log_warn("crpc: winupdate has nonzero len");
 			return -EINVAL;
 		}
 		assert(shdr.len == 0);
 
-		/* update the window */
+		/* update the credit */
 		mutex_lock(&s->lock);
-		cc->win_avail = shdr.win;
-		cc->waiting_winupdate = false;
+		cc->credit = shdr.credit;
+		cc->waiting_resp = false;
 
 #if CBW_TRACK_FLOW
 		if (s->id == CBW_TRACK_FLOW_ID) {
-			printf("[%lu] ===> Winupdate: shdr.win=%lu, win=%u/%u\n",
-			       microtime(), shdr.win, cc->win_used, cc->win_avail);
+			printf("[%lu] ===> Winupdate: shdr.credit=%lu, credit=%u/%u\n",
+			       microtime(), shdr.credit, cc->credit_used, cc->credit);
 		}
 #endif
 
-		if (cc->win_avail > 0) {
+		if (cc->credit > 0) {
 			crpc_drain_queue(s);
 		}
 		mutex_unlock(&s->lock);
-		cc->winu_rx_++;
+		cc->ecredit_rx_++;
 
 		goto again;
 	default:
@@ -638,19 +638,19 @@ void cbw_close(struct crpc_session *s_)
 }
 
 /* client-side stats */
-uint32_t cbw_conn_win_avail(struct crpc_conn *cc_)
+uint32_t cbw_conn_credit(struct crpc_conn *cc_)
 {
 	struct cbw_conn *cc = (struct cbw_conn *)cc_;
-	return cc->win_avail;
+	return cc->credit;
 }
 
-uint32_t cbw_sess_win_avail(struct crpc_session *s_)
+uint32_t cbw_sess_credit(struct crpc_session *s_)
 {
 	struct cbw_session *s = (struct cbw_session *)s_;
 	uint32_t ret = 0;
 
 	for(int i = 0; i < s->cmn.nconns; ++i) {
-		ret += cbw_conn_win_avail(s->cmn.c[i]);
+		ret += cbw_conn_credit(s->cmn.c[i]);
 	}
 
 	return ret;
@@ -660,9 +660,9 @@ void cbw_conn_stat_clear(struct crpc_conn *cc_)
 {
 	struct cbw_conn *cc = (struct cbw_conn *)cc_;
 
-	cc->win_expired_ = 0;
-	cc->winu_rx_ = 0;
-	cc->winu_tx_ = 0;
+	cc->credit_expired_ = 0;
+	cc->ecredit_rx_ = 0;
+	cc->cupdate_tx_ = 0;
 	cc->resp_rx_ = 0;
 	cc->req_tx_ = 0;
 	return;
@@ -678,55 +678,55 @@ void cbw_sess_stat_clear(struct crpc_session *s_)
 	}
 }
 
-uint64_t cbw_conn_stat_win_expired(struct crpc_conn *cc_)
+uint64_t cbw_conn_stat_credit_expired(struct crpc_conn *cc_)
 {
 	struct cbw_conn *cc = (struct cbw_conn *)cc_;
-	return cc->win_expired_;
+	return cc->credit_expired_;
 }
 
-uint64_t cbw_sess_stat_win_expired(struct crpc_session *s_)
+uint64_t cbw_sess_stat_credit_expired(struct crpc_session *s_)
 {
 	struct cbw_session *s = (struct cbw_session *)s_;
 	uint64_t ret = 0;
 
 	for(int i = 0; i < s->cmn.nconns; ++i) {
-		ret += cbw_conn_stat_win_expired(s->cmn.c[i]);
+		ret += cbw_conn_stat_credit_expired(s->cmn.c[i]);
 	}
 
 	return ret;
 }
 
-uint64_t cbw_conn_stat_winu_rx(struct crpc_conn *cc_)
+uint64_t cbw_conn_stat_ecredit_rx(struct crpc_conn *cc_)
 {
 	struct cbw_conn *cc = (struct cbw_conn *)cc_;
-	return cc->winu_rx_;
+	return cc->ecredit_rx_;
 }
 
-uint64_t cbw_sess_stat_winu_rx(struct crpc_session *s_)
+uint64_t cbw_sess_stat_ecredit_rx(struct crpc_session *s_)
 {
 	struct cbw_session *s = (struct cbw_session *)s_;
 	uint64_t ret = 0;
 
 	for(int i = 0; i < s->cmn.nconns; ++i) {
-		ret += cbw_conn_stat_winu_rx(s->cmn.c[i]);
+		ret += cbw_conn_stat_ecredit_rx(s->cmn.c[i]);
 	}
 
 	return ret;
 }
 
-uint64_t cbw_conn_stat_winu_tx(struct crpc_conn *cc_)
+uint64_t cbw_conn_stat_cupdate_tx(struct crpc_conn *cc_)
 {
 	struct cbw_conn *cc = (struct cbw_conn *)cc_;
-	return cc->winu_tx_;
+	return cc->cupdate_tx_;
 }
 
-uint64_t cbw_sess_stat_winu_tx(struct crpc_session *s_)
+uint64_t cbw_sess_stat_cupdate_tx(struct crpc_session *s_)
 {
 	struct cbw_session *s = (struct cbw_session *)s_;
 	uint64_t ret = 0;
 
 	for(int i = 0; i < s->cmn.nconns; ++i) {
-		ret += cbw_conn_stat_winu_tx(s->cmn.c[i]);
+		ret += cbw_conn_stat_cupdate_tx(s->cmn.c[i]);
 	}
 
 	return ret;
@@ -775,17 +775,17 @@ uint64_t cbw_sess_stat_req_dropped(struct crpc_session *s_)
 }
 
 struct crpc_ops cbw_ops = {
-	.crpc_add_connection	= cbw_add_connection,
-	.crpc_send_one		= cbw_send_one,
-	.crpc_recv_one		= cbw_recv_one,
-	.crpc_open		= cbw_open,
-	.crpc_close		= cbw_close,
-	.crpc_win_avail		= cbw_sess_win_avail,
-	.crpc_stat_clear	= cbw_sess_stat_clear,
-	.crpc_stat_winu_rx	= cbw_sess_stat_winu_rx,
-	.crpc_stat_win_expired	= cbw_sess_stat_win_expired,
-	.crpc_stat_winu_tx	= cbw_sess_stat_winu_tx,
-	.crpc_stat_resp_rx	= cbw_sess_stat_resp_rx,
-	.crpc_stat_req_tx	= cbw_sess_stat_req_tx,
-	.crpc_stat_req_dropped	= cbw_sess_stat_req_dropped,
+	.crpc_add_connection		= cbw_add_connection,
+	.crpc_send_one			= cbw_send_one,
+	.crpc_recv_one			= cbw_recv_one,
+	.crpc_open			= cbw_open,
+	.crpc_close			= cbw_close,
+	.crpc_credit			= cbw_sess_credit,
+	.crpc_stat_clear		= cbw_sess_stat_clear,
+	.crpc_stat_ecredit_rx		= cbw_sess_stat_ecredit_rx,
+	.crpc_stat_credit_expired	= cbw_sess_stat_credit_expired,
+	.crpc_stat_cupdate_tx		= cbw_sess_stat_cupdate_tx,
+	.crpc_stat_resp_rx		= cbw_sess_stat_resp_rx,
+	.crpc_stat_req_tx		= cbw_sess_stat_req_tx,
+	.crpc_stat_req_dropped		= cbw_sess_stat_req_dropped,
 };

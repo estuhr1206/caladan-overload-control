@@ -101,9 +101,6 @@ struct sdg_session {
 };
 
 /* credit-related stats */
-atomic64_t srpc_stat_winu_rx_;
-atomic64_t srpc_stat_winu_tx_;
-atomic64_t srpc_stat_win_tx_;
 atomic64_t srpc_stat_req_rx_;
 atomic64_t srpc_stat_req_dropped_;
 atomic64_t srpc_stat_resp_tx_;
@@ -226,7 +223,6 @@ static int srpc_send_completion_vector(struct sdg_session *s,
 #endif
 	atomic_sub_and_fetch(&srpc_num_pending, nrhdr);
 	atomic64_fetch_and_add(&srpc_stat_resp_tx_, nrhdr);
-	atomic64_fetch_and_add(&srpc_stat_win_tx_, 0);
 
 	if (unlikely(ret < 0))
 		return ret;
@@ -513,8 +509,6 @@ static void srpc_listener(void *arg)
 	srpc_avg_st = 0;
 
 	/* init stats */
-	atomic64_write(&srpc_stat_winu_rx_, 0);
-	atomic64_write(&srpc_stat_winu_tx_, 0);
 	atomic64_write(&srpc_stat_req_rx_, 0);
 	atomic64_write(&srpc_stat_resp_tx_, 0);
 
@@ -557,19 +551,19 @@ int sdg_enable(srpc_fn_t handler)
 	return 0;
 }
 
-uint64_t sdg_stat_winu_rx()
+uint64_t sdg_stat_cupdate_rx()
 {
-	return atomic64_read(&srpc_stat_winu_rx_);
+	return 0;
 }
 
-uint64_t sdg_stat_winu_tx()
+uint64_t sdg_stat_ecredit_tx()
 {
-	return atomic64_read(&srpc_stat_winu_tx_);
+	return 0;
 }
 
-uint64_t sdg_stat_win_tx()
+uint64_t sdg_stat_credit_tx()
 {
-	return atomic64_read(&srpc_stat_win_tx_);
+	return 0;
 }
 
 uint64_t sdg_stat_req_rx()
@@ -589,9 +583,9 @@ uint64_t sdg_stat_resp_tx()
 
 struct srpc_ops sdg_ops = {
 	.srpc_enable		= sdg_enable,
-	.srpc_stat_winu_rx	= sdg_stat_winu_rx,
-	.srpc_stat_winu_tx	= sdg_stat_winu_tx,
-	.srpc_stat_win_tx	= sdg_stat_win_tx,
+	.srpc_stat_cupdate_rx	= sdg_stat_cupdate_rx,
+	.srpc_stat_ecredit_tx	= sdg_stat_ecredit_tx,
+	.srpc_stat_credit_tx	= sdg_stat_credit_tx,
 	.srpc_stat_req_rx	= sdg_stat_req_rx,
 	.srpc_stat_req_dropped	= sdg_stat_req_dropped,
 	.srpc_stat_resp_tx	= sdg_stat_resp_tx,

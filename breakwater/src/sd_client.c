@@ -648,7 +648,7 @@ void csd_close(struct crpc_session *s_)
 }
 
 /* client-side stats */
-uint32_t csd_win_avail(struct crpc_session *s_)
+uint32_t csd_credit(struct crpc_session *s_)
 {
 	return 0;
 }
@@ -658,17 +658,17 @@ void csd_stat_clear(struct crpc_session *s_)
 	return;
 }
 
-uint64_t csd_stat_win_expired(struct crpc_session *s_)
+uint64_t csd_stat_credit_expired(struct crpc_session *s_)
 {
 	return 0;
 }
 
-uint64_t csd_stat_winu_rx(struct crpc_session *s_)
+uint64_t csd_stat_ecredit_rx(struct crpc_session *s_)
 {
 	return 0;
 }
 
-uint64_t csd_stat_winu_tx(struct crpc_session *s_)
+uint64_t csd_stat_cupdate_tx(struct crpc_session *s_)
 {
 	return 0;
 }
@@ -728,17 +728,17 @@ uint64_t csd_sess_stat_req_dropped(struct crpc_session *s_)
 }
 
 struct crpc_ops csd_ops = {
-	.crpc_add_connection	= csd_add_connection,
-	.crpc_send_one		= csd_send_one,
-	.crpc_recv_one		= csd_recv_one,
-	.crpc_open		= csd_open,
-	.crpc_close		= csd_close,
-	.crpc_win_avail		= csd_win_avail,
-	.crpc_stat_clear	= csd_stat_clear,
-	.crpc_stat_winu_rx	= csd_stat_winu_rx,
-	.crpc_stat_win_expired	= csd_stat_win_expired,
-	.crpc_stat_winu_tx	= csd_stat_winu_tx,
-	.crpc_stat_resp_rx	= csd_sess_stat_resp_rx,
-	.crpc_stat_req_tx	= csd_sess_stat_req_tx,
-	.crpc_stat_req_dropped	= csd_sess_stat_req_dropped,
+	.crpc_add_connection		= csd_add_connection,
+	.crpc_send_one			= csd_send_one,
+	.crpc_recv_one			= csd_recv_one,
+	.crpc_open			= csd_open,
+	.crpc_close			= csd_close,
+	.crpc_credit			= csd_credit,
+	.crpc_stat_clear		= csd_stat_clear,
+	.crpc_stat_ecredit_rx		= csd_stat_ecredit_rx,
+	.crpc_stat_credit_expired	= csd_stat_credit_expired,
+	.crpc_stat_cupdate_tx		= csd_stat_cupdate_tx,
+	.crpc_stat_resp_rx		= csd_sess_stat_resp_rx,
+	.crpc_stat_req_tx		= csd_sess_stat_req_tx,
+	.crpc_stat_req_dropped		= csd_sess_stat_req_dropped,
 };

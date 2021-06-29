@@ -58,7 +58,7 @@ public:
   LBCTX<T> *Send(const void *buf, size_t len, int hash);
 
   // Returns downstream window size
-  uint32_t WinAvail();
+  uint32_t Credit();
 
   // Convert request/response buffer to LBCTX
   static LBCTX<T> *GetCTX(char *buf);
@@ -145,7 +145,7 @@ LBCTX<T> *LoadBalancer<T, ID_OFF>::Send(const void *buf, size_t len, int hash) {
   // Find a client to send a request
   int idx = next_cidx_;
   for (int i = 0; i < nclients_; ++i) {
-    if (clients_[idx]->WinAvail() > 0) break;
+    if (clients_[idx]->Credit() > 0) break;
     idx = (idx + 1) % nclients_;
   }
 
@@ -157,15 +157,15 @@ LBCTX<T> *LoadBalancer<T, ID_OFF>::Send(const void *buf, size_t len, int hash) {
   return ctx;
 }
 
-// WinAvail(): Returns downstream available window size
+// Credit(): Returns downstream credit
 // TODO: Better to optimize this function. Instaed of sum of windows
 // over the loop, we can maintain a single atomic variable.
 template <typename T, int ID_OFF>
-uint32_t LoadBalancer<T, ID_OFF>::WinAvail() {
+uint32_t LoadBalancer<T, ID_OFF>::Credit() {
   uint32_t ds_win = 0;
 
   for(int i = 0; i < nclients_; ++i) {
-    ds_win += clients_[i]->WinAvail();
+    ds_win += clients_[i]->Credit();
   }
 
   return ds_win;
