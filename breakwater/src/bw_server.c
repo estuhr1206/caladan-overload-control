@@ -431,7 +431,7 @@ static int decr_credit_pool (uint64_t qus)
 	alpha = alpha * SBW_MD;
 	alpha = MAX(1.0 - alpha, 0.5);
 
-	credit_pool = (int)(credit_pool * alpha);
+	credit_pool = MIN((int)(credit_pool * alpha), credit_pool - 1);
 	credit_carry = 0.0;
 
 	credit_pool = MAX(credit_pool, runtime_max_cores());
