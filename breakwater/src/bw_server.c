@@ -70,6 +70,9 @@ atomic_t srpc_num_active;
 /* global credit pool */
 atomic_t srpc_credit_pool;
 
+/* timestamp of the latest credit pool update */
+uint64_t srpc_last_cp_update;
+
 /* global credit used */
 atomic_t srpc_credit_used;
 
@@ -503,6 +506,58 @@ static void wakeup_drained_session(int num_session)
 	}
 }
 
+static void srpc_update_credit_pool()
+{
+	uint64_t now = microtime();
+	uint64_t qus;
+	int new_cp;
+	int credit_used;
+	int credit_unused;
+
+	if (now - srpc_last_cp_update < SBW_RTT_US)
+		return;
+
+	srpc_last_cp_update = now;
+	qus = runtime_queue_us();
+	credit_used = atomic_read(&srpc_credit_used);
+
+	if (qus >= SBW_MIN_DELAY_US)
+		new_cp = decr_credit_pool(qus);
+	else
+		new_cp = incr_credit_pool(qus);
+
+	credit_unused = new_cp - credit_used;
+	wakeup_drained_session(credit_unused);
+	atomic_write(&srpc_credit_pool, new_cp);
+
+#if SBW_TS_OUT
+	record(new_cp, qus);
+#endif
+}
+
+/* srpc_handle_req_drop: a routine called when a request is dropped while
+ * enqueueing
+ *
+ * @ qus: ingress queueing delay
+ * */
+
+static void srpc_handle_req_drop(uint64_t qus)
+{
+	uint64_t now = microtime();
+	int new_cp;
+
+	if (now - srpc_last_cp_update < SBW_RTT_US)
+		return;
+
+	srpc_last_cp_update = now;
+	new_cp = decr_credit_pool(qus);
+
+	atomic_write(&srpc_credit_pool, new_cp);
+#if SBW_TS_OUT
+	record(new_cp, qus);
+#endif
+}
+
 static void srpc_worker(void *arg)
 {
 	struct sbw_ctx *c = (struct sbw_ctx *)arg;
@@ -526,6 +581,10 @@ static void srpc_worker(void *arg)
 	th = s->sender_th;
 	s->sender_th = NULL;
 	spin_unlock_np(&s->lock);
+
+	// update credit pool
+	srpc_update_credit_pool();
+
 	if (th)
 		thread_ready(th);
 }
@@ -539,6 +598,7 @@ static int srpc_recv_one(struct sbw_session *s)
 	int credit_diff;
 	char buf_tmp[SRPC_BUF_SIZE];
 	struct sbw_ctx *c;
+	uint64_t us;
 
 again:
 	th = NULL;
@@ -602,10 +662,12 @@ again:
 
 		atomic_inc(&srpc_num_pending);
 
-		if (SBW_DROP_THRESH > 0 &&
-		    runtime_queue_us() >= SBW_DROP_THRESH) {
+		us = runtime_queue_us();
+		if (SBW_DROP_THRESH > 0 && us >= SBW_DROP_THRESH) {
 			thread_t *th;
 
+			// precedure called when the incoming request is dropped
+			srpc_handle_req_drop(us);
 			c->cmn.drop = true;
 			bitmap_set(s->completed_slots, idx);
 			th = s->sender_th;
@@ -888,38 +950,9 @@ static void srpc_server(void *arg)
 		assert(atomic_read(&srpc_num_drained) == 0);
 		atomic_write(&srpc_credit_used, 0);
 		atomic_write(&srpc_credit_pool, runtime_max_cores());
+		srpc_last_cp_update = microtime();
 		atomic_write(&srpc_credit_ds, 0);
 		fflush(stdout);
-	}
-}
-
-static void srpc_cc_worker(void *arg)
-{
-	uint64_t us;
-	int new_cp;
-	int credit_used;
-	int credit_unused;
-
-	while (true) {
-		timer_sleep(SBW_RTT_US);
-		us = runtime_queue_us();
-
-		if (us >= SBW_MIN_DELAY_US)
-			new_cp = decr_credit_pool(us);
-		else
-			new_cp = incr_credit_pool(us);
-
-		// Wake up threads from drained list
-		credit_used = atomic_read(&srpc_credit_used);
-		credit_unused = new_cp - credit_used;
-
-		wakeup_drained_session(credit_unused);
-		atomic_write(&srpc_credit_pool, new_cp);
-
-#if SBW_TS_OUT
-		if (new_cp > 0)
-			record(new_cp, us);
-#endif
 	}
 }
 
@@ -940,6 +973,7 @@ static void srpc_listener(void *arg)
 	atomic_write(&srpc_num_drained, 0);
 
 	atomic_write(&srpc_credit_pool, runtime_max_cores());
+	srpc_last_cp_update = microtime();
 	atomic_write(&srpc_credit_used, 0);
 	atomic_write(&srpc_credit_ds, 0);
 	atomic_write(&srpc_num_pending, 0);
@@ -957,9 +991,6 @@ static void srpc_listener(void *arg)
 	laddr.port = SRPC_PORT;
 
 	ret = tcp_listen(laddr, 4096, &q);
-	BUG_ON(ret);
-
-	ret = thread_spawn(srpc_cc_worker, NULL);
 	BUG_ON(ret);
 
 	while (true) {
