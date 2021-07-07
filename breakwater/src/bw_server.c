@@ -90,8 +90,13 @@ double credit_carry;
 /* drained session list */
 struct srpc_drained_ {
 	spinlock_t lock;
-	struct list_head list;
-	void *pad[5];
+	// high priority sessions (demand > 0)
+	// LIFO queue
+	struct list_head list_h;
+	// low priority sessions (demand == 0)
+	// FIFO queue
+	struct list_head list_l;
+	void *pad[3];
 };
 
 BUILD_ASSERT(sizeof(struct srpc_drained_) == CACHE_LINE_SIZE);
@@ -107,6 +112,8 @@ struct sbw_session {
 	/* drained_list's core number. -1 if not in the drained list */
 	int			drained_core;
 	bool			is_linked;
+	/* when this session has been drained (used for priority change) */
+	uint64_t		drained_ts;
 	bool			wake_up;
 	waitgroup_t		send_waiter;
 	int			credit;
@@ -355,7 +362,67 @@ static void srpc_update_credit(struct sbw_session *s, bool req_dropped)
 #endif
 }
 
-static struct sbw_session *srpc_choose_drained_session(int core_id)
+/* srpc_choose_drained_h: choose a drained session with high priority */
+static struct sbw_session *srpc_choose_drained_h(int core_id)
+{
+	struct sbw_session *ret;
+	struct sbw_session *s;
+	uint64_t now = microtime();
+	int demand_timeout = MAX(CBW_MAX_CLIENT_DELAY_US - SBW_RTT_US, 0);
+
+	assert(core_id >= 0);
+	assert(core_id < runtime_max_cores());
+
+	ret = NULL;
+
+	if (list_empty(&srpc_drained[core_id].list_h))
+		return NULL;
+
+	spin_lock_np(&srpc_drained[core_id].lock);
+
+	// First check for the sessions with outdated demand
+	while (true) {
+		s = list_tail(&srpc_drained[core_id].list_h,
+			      struct sbw_session,
+			      drained_link);
+		if (!s) break;
+
+		spin_lock_np(&s->lock);
+		if (now > (s->drained_ts + demand_timeout)) {
+			// enough time has passed
+			list_del(&s->drained_link);
+			// move to low priority queue
+			list_add_tail(&srpc_drained[core_id].list_l,
+				      &s->drained_link);
+		} else {
+			spin_unlock_np(&s->lock);
+			break;
+		}
+		spin_unlock_np(&s->lock);
+	}
+
+	if (list_empty(&srpc_drained[core_id].list_h)) {
+		spin_unlock_np(&srpc_drained[core_id].lock);
+		return NULL;
+	}
+
+	ret = list_pop(&srpc_drained[core_id].list_h,
+		       struct sbw_session,
+		       drained_link);
+
+	BUG_ON(!ret->is_linked);
+	ret->is_linked = false;
+	spin_unlock_np(&srpc_drained[core_id].lock);
+	spin_lock_np(&ret->lock);
+	ret->drained_core = -1;
+	spin_unlock_np(&ret->lock);
+	atomic_dec(&srpc_num_drained);
+
+	return ret;
+}
+
+/* srpc_choose_drained_l: choose a drained session with low priority */
+static struct sbw_session *srpc_choose_drained_l(int core_id)
 {
 	struct sbw_session *ret;
 
@@ -364,16 +431,16 @@ static struct sbw_session *srpc_choose_drained_session(int core_id)
 
 	ret = NULL;
 
-	if (list_empty(&srpc_drained[core_id].list))
+	if (list_empty(&srpc_drained[core_id].list_l))
 		return NULL;
 
 	spin_lock_np(&srpc_drained[core_id].lock);
-	if (list_empty(&srpc_drained[core_id].list)) {
+	if (list_empty(&srpc_drained[core_id].list_l)) {
 		spin_unlock_np(&srpc_drained[core_id].lock);
 		return NULL;
 	}
 
-	ret = list_pop(&srpc_drained[core_id].list,
+	ret = list_pop(&srpc_drained[core_id].list_l,
 		       struct sbw_session,
 		       drained_link);
 
@@ -474,12 +541,22 @@ static void wakeup_drained_session(int num_session)
 	thread_t *th;
 
 	while (num_session > 0) {
-		ws = srpc_choose_drained_session(core_id);
+		ws = srpc_choose_drained_h(core_id);
 
 		i = (core_id + 1) % max_cores;
 		while (!ws && i != core_id) {
-			ws = srpc_choose_drained_session(i);
+			ws = srpc_choose_drained_h(i);
 			i = (i + 1) % max_cores;
+		}
+
+		if (!ws) {
+			ws = srpc_choose_drained_l(core_id);
+
+			i = (core_id + 1) % max_cores;
+			while (!ws && i != core_id) {
+				ws = srpc_choose_drained_l(i);
+				i = (i + 1) % max_cores;
+			}
 		}
 
 		if (!ws)
@@ -697,18 +774,34 @@ again:
 		old_demand = s->demand;
 		s->demand = chdr.demand;
 
-		if (old_demand > 0 && s->demand == 0) {
-			srpc_remove_from_drained_list(s);
-		} else if (old_demand == 0 && s->demand > 0) {
+		BUG_ON(old_demand > 0);
+		BUG_ON(s->drained_core > -1);
+		// if s->num_pending > 0 do nothing.
+		// sender thread will handle this session.
+		if (s->num_pending == 0 && s->demand > 0) {
+			// With positive demand
+			// sender will handle this session
 			if (s->num_pending == 0) {
 				th = s->sender_th;
 				s->sender_th = NULL;
 				s->need_ecredit = true;
 			}
-		}
-
-		if (s->demand == 0)
+		} else if (s->num_pending == 0) {
+			// s->demand == 0
+			// push the session to the low priority drained queue
+			unsigned int core_id = get_current_affinity();
+			spin_lock_np(&srpc_drained[core_id].lock);
+			BUG_ON(s->is_linked);
+			BUG_ON(s->credit > 0);
+			// FIFO queue
+			list_add_tail(&srpc_drained[core_id].list_l,
+				      &s->drained_link);
+			s->is_linked = true;
+			spin_unlock_np(&srpc_drained[core_id].lock);
+			s->drained_core = core_id;
+			atomic_inc(&srpc_num_drained);
 			s->advertised = 0;
+		}
 
 		/* adjust credit if demand changed */
 		if (s->credit > s->num_pending + s->demand) {
@@ -819,7 +912,6 @@ static void srpc_sender(void *arg)
 
 		/* send a response for each completed slot */
 		ret = srpc_send_completion_vector(s, tmp);
-		core_id = get_current_affinity();
 
 		/* add to the drained list if (1) credit becomes zero,
 		 * (2) s is not in the list already,
@@ -827,12 +919,23 @@ static void srpc_sender(void *arg)
 		if (credit == 0 && drained_core == -1 &&
 		    bitmap_popcount(s->avail_slots, SBW_MAX_WINDOW) ==
 		    SBW_MAX_WINDOW) {
+			core_id = get_current_affinity();
 			spin_lock_np(&s->lock);
 			spin_lock_np(&srpc_drained[core_id].lock);
-			assert(!s->is_linked);
+			BUG_ON(s->is_linked);
 			BUG_ON(s->credit > 0);
-			list_add_tail(&srpc_drained[core_id].list,
-				      &s->drained_link);
+			if (s->demand > 0) {
+				// positive demand: drained with high priority
+				// LIFO queue
+				list_add(&srpc_drained[core_id].list_h,
+					 &s->drained_link);
+				s->drained_ts = microtime();
+			} else {
+				// zero demand: drained with low priority
+				// FIFO queue
+				list_add_tail(&srpc_drained[core_id].list_l,
+					      &s->drained_link);
+			}
 			s->is_linked = true;
 			spin_unlock_np(&srpc_drained[core_id].lock);
 			s->drained_core = core_id;
@@ -952,7 +1055,8 @@ static void srpc_listener(void *arg)
 
 	for (i = 0 ; i < NCPU ; ++i) {
 		spin_lock_init(&srpc_drained[i].lock);
-		list_head_init(&srpc_drained[i].list);
+		list_head_init(&srpc_drained[i].list_h);
+		list_head_init(&srpc_drained[i].list_l);
 	}
 
 	atomic_write(&srpc_num_sess, 0);
