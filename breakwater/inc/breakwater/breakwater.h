@@ -45,7 +45,6 @@ struct cbw_session {
 	uint64_t		req_id;
 	int			next_conn_idx;
 	bool			running;
-	bool			demand_sync;
 	bool			init;
 	mutex_t			lock;
 

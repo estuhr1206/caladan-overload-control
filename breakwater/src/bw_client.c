@@ -41,8 +41,6 @@ static ssize_t crpc_send_cupdate(struct cbw_conn *cc)
 	chdr.len = 0;
 	chdr.demand = s->head - s->tail;
 	chdr.flags = 0;
-	if (s->demand_sync)
-		chdr.flags |= BW_CFLAG_DSYNC;
 
 	/* send the request */
 	ret = tcp_write_full(cc->cmn.c, &chdr, sizeof(chdr));
@@ -88,8 +86,6 @@ static ssize_t crpc_send_request_vector(struct cbw_conn *cc)
 		chdr[nrhdr].demand = s->head - s->tail;
 		chdr[nrhdr].ts_sent = now;
 		chdr[nrhdr].flags = 0;
-		if (s->demand_sync)
-			chdr[nrhdr].flags |= BW_CFLAG_DSYNC;
 
 		vec[nriov].iov_base = &chdr[nrhdr];
 		vec[nriov].iov_len = sizeof(struct cbw_hdr);
@@ -145,8 +141,6 @@ static ssize_t crpc_send_raw(struct cbw_conn *cc,
 	chdr.demand = s->head - s->tail;
 	chdr.ts_sent = now;
 	chdr.flags = 0;
-	if (s->demand_sync)
-		chdr.flags |= BW_CFLAG_DSYNC;
 
 	/* initialize the SG vector */
 	vec[0].iov_base = &chdr;
@@ -182,17 +176,8 @@ static void crpc_drain_queue(struct cbw_session *s)
 	assert_mutex_held(&s->lock);
 
 	/* If queue is empty */
-//	if (s->head == s->tail || s->waiting_winupdate)
 	if (s->head == s->tail)
 		return;
-
-	/* for now, let's ignore demand sync */
-	/**
-	if (s->win_avail == 0 && s->demand_sync) {
-		s->waiting_winupdate = true;
-		crpc_send_winupdate(s);
-		return;
-	}**/
 
 	/* choose request to send from request queue */
 	while (s->head != s->tail) {
@@ -512,12 +497,6 @@ static void crpc_timer(void *arg)
 
 		// If queue becomes empty
 		if (s->head == s->tail) {
-			// Let's ignore demand sync for now
-			/*
-			if (num_drops > 0 && s->demand_sync) {
-				s->waiting_winupdate = false;
-				crpc_send_winupdate(s);
-			}*/
 			continue;
 		}
 
@@ -585,7 +564,6 @@ int cbw_open(struct netaddr raddr, struct crpc_session **sout, int id,
 	s->cmn.ldrop_handler = ldrop_handler;
 	s->cmn.rdrop_handler = rdrop_handler;
 	s->running = true;
-	s->demand_sync = false;
 	s->id = id;
 	s->req_id = 1;
 

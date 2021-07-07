@@ -118,7 +118,6 @@ struct sbw_session {
 	uint64_t		demand;
 	/* timestamp for the last explicit credit issue */
 	uint64_t		last_ecredit_timestamp;
-	bool			demand_sync;
 
 	/* shared state between receiver and sender */
 	DEFINE_BITMAP(avail_slots, SBW_MAX_WINDOW);
@@ -337,18 +336,14 @@ static void srpc_update_credit(struct sbw_session *s, bool req_dropped)
 		s->credit = MAX(s->credit, max_overprovision);
 
 	// prioritize the session
-	if (old_credit > 0 && s->credit == 0 && !req_dropped && !s->demand_sync)
+	if (old_credit > 0 && s->credit == 0 && !req_dropped)
 		s->credit = max_overprovision;
 
 	/* clamp to supported values */
 	/* now we allow zero credit */
 	s->credit = MAX(s->credit, s->num_pending);
 	s->credit = MIN(s->credit, SBW_MAX_WINDOW - 1);
-
-	if (s->demand_sync)
-		s->credit = MIN(s->credit, s->num_pending + s->demand);
-	else
-		s->credit = MIN(s->credit, s->num_pending + s->demand + max_overprovision);
+	s->credit = MIN(s->credit, s->num_pending + s->demand + max_overprovision);
 
 	credit_diff = s->credit - old_credit;
 	atomic_fetch_and_add(&srpc_credit_used, credit_diff);
@@ -650,7 +645,6 @@ again:
 		spin_lock_np(&s->lock);
 		old_demand = s->demand;
 		s->demand = chdr.demand;
-		s->demand_sync = (chdr.flags & BW_CFLAG_DSYNC);
 		srpc_remove_from_drained_list(s);
 		s->num_pending++;
 		/* adjust credit if demand changed */
@@ -702,7 +696,6 @@ again:
 		spin_lock_np(&s->lock);
 		old_demand = s->demand;
 		s->demand = chdr.demand;
-		s->demand_sync = (chdr.flags & BW_CFLAG_DSYNC);
 
 		if (old_demand > 0 && s->demand == 0) {
 			srpc_remove_from_drained_list(s);
@@ -835,22 +828,15 @@ static void srpc_sender(void *arg)
 		    bitmap_popcount(s->avail_slots, SBW_MAX_WINDOW) ==
 		    SBW_MAX_WINDOW) {
 			spin_lock_np(&s->lock);
-			if (!s->demand_sync || s->demand > 0) {
-				spin_lock_np(&srpc_drained[core_id].lock);
-				assert(!s->is_linked);
-				BUG_ON(s->credit > 0);
-				if (!s->demand_sync) {
-					list_add_tail(&srpc_drained[core_id].list,
-						      &s->drained_link);
-				} else if (s->demand > 0) {
-					list_add_tail(&srpc_drained[core_id].list,
-						      &s->drained_link);
-				}
-				s->is_linked = true;
-				spin_unlock_np(&srpc_drained[core_id].lock);
-				s->drained_core = core_id;
-				atomic_inc(&srpc_num_drained);
-			}
+			spin_lock_np(&srpc_drained[core_id].lock);
+			assert(!s->is_linked);
+			BUG_ON(s->credit > 0);
+			list_add_tail(&srpc_drained[core_id].list,
+				      &s->drained_link);
+			s->is_linked = true;
+			spin_unlock_np(&srpc_drained[core_id].lock);
+			s->drained_core = core_id;
+			atomic_inc(&srpc_num_drained);
 			spin_unlock_np(&s->lock);
 #if SBW_TRACK_FLOW
 			if (s->id == SBW_TRACK_FLOW_ID) {
