@@ -19,6 +19,7 @@ struct mutex {
 	atomic_t		held;
 	spinlock_t		waiter_lock;
 	struct list_head	waiters;
+	uint64_t		oldest_tsc;
 };
 
 typedef struct mutex mutex_t;
@@ -26,6 +27,7 @@ typedef struct mutex mutex_t;
 extern void __mutex_lock(mutex_t *m);
 extern void __mutex_unlock(mutex_t *m);
 extern void mutex_init(mutex_t *m);
+extern uint64_t mutex_queue_us(mutex_t *m);
 
 /**
  * mutex_try_lock - attempts to acquire a mutex
@@ -87,6 +89,7 @@ static inline void assert_mutex_held(mutex_t *m)
 struct condvar {
 	spinlock_t		waiter_lock;
 	struct list_head	waiters;
+	uint64_t		oldest_tsc;
 };
 
 typedef struct condvar condvar_t;
@@ -97,6 +100,8 @@ extern void condvar_timed_wait(condvar_t *cv, mutex_t *m,
 extern void condvar_signal(condvar_t *cv);
 extern void condvar_broadcast(condvar_t *cv);
 extern void condvar_init(condvar_t *cv);
+
+extern uint64_t condvar_queue_us(condvar_t *cv);
 
 
 /*

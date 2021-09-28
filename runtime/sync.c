@@ -31,7 +31,11 @@ void __mutex_lock(mutex_t *m)
 	}
 
 	myth = thread_self();
+	bool is_first = list_empty(&m->waiters);
+	myth->ready_tsc = rdtsc();
 	list_add_tail(&m->waiters, &myth->link);
+	if (is_first)
+		m->oldest_tsc = myth->ready_tsc;
 	thread_park_and_unlock_np(&m->waiter_lock);
 }
 
@@ -48,6 +52,13 @@ void __mutex_unlock(mutex_t *m)
 		spin_unlock_np(&m->waiter_lock);
 		return;
 	}
+
+	if (list_empty(&m->waiters)) {
+		m->oldest_tsc = UINT64_MAX;
+	} else {
+		thread_t *oldest_th = list_top(&m->waiters, thread_t, link);
+		m->oldest_tsc = oldest_th->ready_tsc;
+	}
 	spin_unlock_np(&m->waiter_lock);
 	thread_ready(waketh);
 }
@@ -61,6 +72,21 @@ void mutex_init(mutex_t *m)
 	atomic_write(&m->held, 0);
 	spin_lock_init(&m->waiter_lock);
 	list_head_init(&m->waiters);
+	m->oldest_tsc = UINT64_MAX;
+}
+
+/**
+ * mutex_queue_us - returns mutex queueing delay
+ * @m: the mutex to get queueing delay
+ */
+uint64_t mutex_queue_us(mutex_t *m)
+{
+	uint64_t cur_tsc = rdtsc();
+	if (cur_tsc < m->oldest_tsc) {
+		return 0;
+	} else {
+		return (cur_tsc - m->oldest_tsc) / cycles_per_us;
+	}
 }
 
 /*
@@ -219,7 +245,11 @@ void condvar_wait(condvar_t *cv, mutex_t *m)
 	spin_lock_np(&cv->waiter_lock);
 	myth = thread_self();
 	mutex_unlock(m);
+	bool is_first = list_empty(&cv->waiters);
+	myth->ready_tsc = rdtsc();
 	list_add_tail(&cv->waiters, &myth->link);
+	if (is_first)
+		cv->oldest_tsc = myth->ready_tsc;
 	thread_park_and_unlock_np(&cv->waiter_lock);
 
 	mutex_lock(m);
@@ -244,6 +274,12 @@ static void condvar_timed_wait_expired(unsigned long args) {
 			list_del(&waiter->link);
 			break;
 		}
+	}
+	if (list_empty(&cv->waiters)) {
+		cv->oldest_tsc = UINT64_MAX;
+	} else {
+		thread_t *oldest_th = list_top(&cv->waiters, thread_t, link);
+		cv->oldest_tsc = oldest_th->ready_tsc;
 	}
 	spin_unlock_np(&cv->waiter_lock);
 
@@ -288,6 +324,12 @@ void condvar_signal(condvar_t *cv)
 
 	spin_lock_np(&cv->waiter_lock);
 	waketh = list_pop(&cv->waiters, thread_t, link);
+	if (list_empty(&cv->waiters)) {
+		cv->oldest_tsc = UINT64_MAX;
+	} else {
+		thread_t *oldest_th = list_top(&cv->waiters, thread_t, link);
+		cv->oldest_tsc = oldest_th->ready_tsc;
+	}
 	spin_unlock_np(&cv->waiter_lock);
 	if (waketh)
 		thread_ready(waketh);
@@ -306,6 +348,7 @@ void condvar_broadcast(condvar_t *cv)
 
 	spin_lock_np(&cv->waiter_lock);
 	list_append_list(&tmp, &cv->waiters);
+	cv->oldest_tsc = UINT64_MAX;
 	spin_unlock_np(&cv->waiter_lock);
 
 	while (true) {
@@ -324,6 +367,21 @@ void condvar_init(condvar_t *cv)
 {
 	spin_lock_init(&cv->waiter_lock);
 	list_head_init(&cv->waiters);
+	cv->oldest_tsc = UINT64_MAX;
+}
+
+/**
+ * condvar_queue_us - returns queueing delay of condvar
+ * @cv: the condvar to get queueing delay
+ */
+uint64_t condvar_queue_us(condvar_t *cv)
+{
+	uint64_t cur_tsc = rdtsc();
+	if (cur_tsc < cv->oldest_tsc) {
+		return 0;
+	} else {
+		return (cur_tsc - cv->oldest_tsc) / cycles_per_us;
+	}
 }
 
 
