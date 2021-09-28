@@ -19,7 +19,7 @@
 */
 
 /* delay threshold to detect congestion */
-#define SBW_MIN_DELAY_US		80
+#define SBW_DELAY_TARGET		80
 /* delay threshold for AQM */
 #define SBW_DROP_THRESH			160
 

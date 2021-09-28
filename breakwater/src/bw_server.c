@@ -492,7 +492,7 @@ static int decr_credit_pool (uint64_t qus)
 	float alpha;
 	int credit_pool = atomic_read(&srpc_credit_pool);
 
-	alpha = (qus - SBW_MIN_DELAY_US) / (float)SBW_MIN_DELAY_US;
+	alpha = (qus - SBW_DELAY_TARGET) / (float)SBW_DELAY_TARGET;
 	alpha = alpha * SBW_MD;
 	alpha = MAX(1.0 - alpha, 0.5);
 
@@ -593,7 +593,7 @@ static void srpc_update_credit_pool()
 	qus = runtime_queue_us();
 	credit_used = atomic_read(&srpc_credit_used);
 
-	if (qus >= SBW_MIN_DELAY_US)
+	if (qus >= SBW_DELAY_TARGET)
 		new_cp = decr_credit_pool(qus);
 	else
 		new_cp = incr_credit_pool(qus);
