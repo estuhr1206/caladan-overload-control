@@ -7,6 +7,7 @@ extern "C" {
 #include <breakwater/seda.h>
 #include <breakwater/dagor.h>
 #include <breakwater/nocontrol.h>
+#include <breakwater/sync.h>
 }
 
 #include "cc/net.h"
@@ -75,8 +76,8 @@ int total_agents = 1;
 // number of iterations required for 1us on target server
 constexpr uint64_t kIterationsPerUS = 69;  // 83
 // Total duration of the experiment in us
-constexpr uint64_t kWarmUpTime = 2000000;
-constexpr uint64_t kExperimentTime = 4000000;
+constexpr uint64_t kWarmUpTime = 4000000;
+constexpr uint64_t kExperimentTime = 8000000;
 // RTT
 constexpr uint64_t kRTT = 10;
 constexpr uint64_t kNumDupClient = 32;
@@ -175,6 +176,7 @@ struct work_unit {
   double start_us, work_us, duration_us;
   int hash;
   bool success;
+  bool is_monster;
   uint64_t credit;
   uint64_t tsc;
   uint32_t cpu;
@@ -465,6 +467,14 @@ constexpr uint64_t kNetbenchPort = 8001;
 // The maximum lateness to tolerate before dropping egress samples.
 constexpr uint64_t kMaxCatchUpUS = 5;
 
+#define BOTTLENECK_N 2
+
+//static rt::Mutex shared_mutex;
+static mutex_t shared_mutex[BOTTLENECK_N];
+static spinlock_t shared_spin[BOTTLENECK_N];
+static rt::CondVar shared_cv;
+static int running;
+
 void RpcServer(struct srpc_ctx *ctx) {
   // Validate and parse the request.
   if (unlikely(ctx->req_len != sizeof(payload))) {
@@ -475,10 +485,158 @@ void RpcServer(struct srpc_ctx *ctx) {
 
   // Perform the synthetic work.
   uint64_t workn = ntoh64(in->work_iterations);
+  uint64_t hash = ntoh64(in->hash);
   int core_id = get_current_affinity();
   SyntheticWorker *w = workers[core_id];
+  int stype = ctx->s->session_type;
 
-  if (workn != 0) w->Work(workn);
+  int midx;
+
+  if (hash % 1000 < 500) midx = 0;
+  else midx = 1;
+
+  if (workn != 0) {
+    mutex_lock(&shared_mutex[midx]);
+    workers[get_current_affinity()]->Work(workn);
+    mutex_unlock(&shared_mutex[midx]);
+    /*
+    if (mutex_try_lock(&shared_mutex[midx])) {
+      workers[get_current_affinity()]->Work(workn);
+      mutex_unlock(&shared_mutex[midx]);
+    } else {
+      ctx->drop = true;
+      return;
+    }*/
+    /*if (mutex_lock_if_uncongested(&shared_mutex[midx])) {
+      workers[get_current_affinity()]->Work(workn);
+      mutex_unlock(&shared_mutex[midx]);
+    } else {
+      ctx->drop = true;
+      return;
+    }*/
+  }
+
+  //if (workn != 0) w->Work(workn);
+  /*
+  if (workn != 0) {
+    if (hash % 1000 < 200) {
+      if (mutex_try_lock(&shared_mutex[0])) {
+	workers[get_current_affinity()]->Work(workn);
+	mutex_unlock(&shared_mutex[0]);
+      } else {
+        ctx->drop = true;
+	return;
+      }
+  */
+
+      /*
+      mutex_lock(&shared_mutex[midx]);
+      workers[get_current_affinity()]->Work(workn);
+      mutex_unlock(&shared_mutex[midx]);
+      */
+
+      //mutex_lock(&shared_mutex[midx]);
+      /*if (!mutex_lock_if_uncongested(&shared_mutex[midx])) {
+        ctx->drop = true;
+	return;
+      }*/
+      //spin_lock_np(&shared_spin[midx]);
+      //w->Work(workn);
+      //spin_unlock_np(&shared_spin[midx]);
+      //mutex_unlock(&shared_mutex[midx]);
+/*
+    } else {
+      if (mutex_try_lock(&shared_mutex[1])) {
+	workers[get_current_affinity()]->Work(workn);
+	mutex_unlock(&shared_mutex[1]);
+      } else {
+        ctx->drop = true;
+	return;
+      }
+    }
+  }
+*/
+/*
+  if (workn != 0) {
+    if (hash % 100 <= 20) {
+      shared_mutex.Lock();
+      if (get_latency_budget() == 0) {
+        ctx->drop = true;
+	return;
+      }
+      w->Work(workn);
+      shared_mutex.Unlock();
+    } else {
+      w->Work(workn);
+    }
+  }
+*/
+/*
+  if (workn != 0) {
+    switch (stype) {
+      case 0:
+        w->Work(workn);
+	break;
+      case 1:
+	shared_mutex.Lock();
+	w->Work(workn);
+	shared_mutex.Unlock();
+      default:
+	break;
+    }
+  }
+*/
+//    shared_mutex.Lock();
+//    w->Work(workn);
+//    shared_mutex.Unlock();
+/*
+  if (workn != 0) {
+	  shared_mutex.Lock();
+	  while (running > 2)
+		  shared_cv.Wait(&shared_mutex);
+	  running++;
+	  shared_mutex.Unlock();
+
+	  w->Work(workn);
+
+	  shared_mutex.Lock();
+	  running--;
+	  shared_cv.Signal();
+	  shared_mutex.Unlock();
+  }
+*/
+  /*
+  const int npara = 16;
+  std::vector<rt::Thread> ths;
+  if (workn != 0) {
+    for (int i = 0; i < npara; ++i) {
+      ths.emplace_back(rt::Thread([&, i] {
+        w->Work(workn / npara);
+      }));
+    }
+
+    for (auto &th : ths)
+      th.Join();
+  }*/
+
+  /*
+  const int npara = 8;
+  std::vector<rt::Thread> ths;
+  for (int i = 0; i < npara; ++i) {
+    ths.emplace_back(rt::Thread([&, i] {
+      shared_mutex[(hash + i) % 10].Lock();
+      w->Work(workn/npara);
+      shared_mutex[(hash + i) % 10].Unlock();
+    }));
+  }
+
+  uint64_t start = rdtsc();
+  for (auto &th : ths)
+    th.Join();
+  uint64_t end = rdtsc();
+
+  add_thread_mutex_delay(end - start);
+  */
 
   // Craft a response.
   ctx->resp_len = sizeof(payload);
@@ -498,8 +656,14 @@ void ServerHandler(void *arg) {
     if (workers[i] == nullptr) panic("cannot create worker");
   }
 
+  running = 0;
+
   int ret = rpc::RpcServerEnable(RpcServer);
   if (ret) panic("couldn't enable RPC server");
+
+  //sbw_register_delay_source(0, get_mutex_delay);
+  //sbw_register_delay_source(1, get_mutex_delay);
+
   // waits forever.
   rt::WaitGroup(1).Wait();
 }
@@ -685,16 +849,17 @@ void SEQHandler(void *arg) {
 
 template <class Arrival, class Service>
 std::vector<work_unit> GenerateWork(Arrival a, Service s, double cur_us,
-                                    double last_us) {
+                                    double last_us, bool is_monster) {
   std::vector<work_unit> w;
   double st_us;
   while (true) {
-    if (cur_us < 4000000)
+/*
+    if (cur_us < 3000000)
       cur_us += a();
-    else if (cur_us < 6000000)
-      cur_us += a() / 2.0;
     else
-      cur_us += a();
+      cur_us += a() / 5.0;
+*/
+    cur_us += a();
     if (cur_us > last_us) break;
     switch (st_type) {
       case 1: // exponential
@@ -713,7 +878,7 @@ std::vector<work_unit> GenerateWork(Arrival a, Service s, double cur_us,
       default:
 	panic("unknown service time distribution");
     }
-    w.emplace_back(work_unit{cur_us, st_us, 0, rand(), false});
+    w.emplace_back(work_unit{cur_us, st_us, 0, rand(), false, is_monster});
   }
 
   return w;
@@ -783,7 +948,7 @@ std::vector<work_unit> ClientWorker(
     // Send an RPC request.
     p.work_iterations = hton64(w[i].work_us * kIterationsPerUS);
     p.index = hton64(i);
-    p.hash = w[i].hash;
+    p.hash = hton64(w[i].hash);
     ssize_t ret = c->Send(&p, sizeof(p), w[i].hash, (void *)w.data());
     if (ret == -ENOBUFS) continue;
     if (ret != static_cast<ssize_t>(sizeof(p)))
@@ -792,7 +957,9 @@ std::vector<work_unit> ClientWorker(
 
   // rt::Sleep(1 * rt::kSeconds);
   rt::Sleep((int)(kRTT + 2 * st));
+  //c->Abort();
   BUG_ON(c->Shutdown(SHUT_RDWR));
+
   for (auto &th : ths)
     th.Join();
 
@@ -820,7 +987,8 @@ void ClientRemoteDropHandler(void *buf, size_t len, void *arg) {
 
 std::vector<work_unit> RunExperiment(
     int threads, struct cstat_raw *csr, struct sstat *ss, double *elapsed,
-    std::function<std::vector<work_unit>()> wf) {
+    std::function<std::vector<work_unit>()> wf,
+    std::function<std::vector<work_unit>()> wf2) {
   // Create one TCP connection per thread.
   std::vector<std::unique_ptr<rpc::RpcClient>> clients;
   sstat_raw s1, s2;
@@ -830,9 +998,12 @@ std::vector<work_unit> RunExperiment(
   int conn_idx;
 
   for (int i = 0; i < threads; ++i) {
+    //struct rpc_session_info info = {.session_type = (i % 10 < 1 ? 1 : 0)};
+    struct rpc_session_info info = {.session_type = 0};
     std::unique_ptr<rpc::RpcClient> outc(rpc::RpcClient::Dial(raddr[0], i + 1,
 					ClientLocalDropHandler,
-					ClientRemoteDropHandler));
+					ClientRemoteDropHandler,
+					&info));
     if (unlikely(outc == nullptr)) panic("couldn't connect to raddr.");
 
     if (nconn[0] > 1) {
@@ -859,8 +1030,15 @@ std::vector<work_unit> RunExperiment(
 
   std::vector<rt::Thread> th;
   std::unique_ptr<std::vector<work_unit>> samples[threads];
-  for (int i = 0; i < threads; ++i) {
+
+  th.emplace_back(rt::Thread([&] {
+    auto v = ClientWorker(clients[0].get(), &starter, &starter2, wf2);
+    samples[0].reset(new std::vector<work_unit>(std::move(v)));
+  }));
+
+  for (int i = 1; i < threads; ++i) {
     th.emplace_back(rt::Thread([&, i] {
+      srand(time(NULL) * (i+1));
       auto v = ClientWorker(clients[i].get(), &starter, &starter2, wf);
       samples[i].reset(new std::vector<work_unit>(std::move(v)));
     }));
@@ -895,7 +1073,9 @@ std::vector<work_unit> RunExperiment(
   }
 
   // Wait for the workers to finish.
-  for (auto &t : th) t.Join();
+  for (auto &t : th) {
+    t.Join();
+  }
 
   // |--- end experiment duration timing ---|
   barrier();
@@ -921,7 +1101,6 @@ std::vector<work_unit> RunExperiment(
       csr->resp_rx += c->StatRespRx();
       csr->req_tx += c->StatReqTx();
       csr->credit_expired += c->StatCreditExpired();
-      csr->req_dropped += c->StatReqDropped();
       c->Close();
     }
   }
@@ -933,6 +1112,7 @@ std::vector<work_unit> RunExperiment(
   uint64_t good_resps = 0;
   uint64_t resps = 0;
   uint64_t offered = 0;
+  uint64_t client_drop = 0;
 
   for (int i = 0; i < threads; ++i) {
     auto &v = *samples[i];
@@ -940,12 +1120,22 @@ std::vector<work_unit> RunExperiment(
     int slo_success;
     int resp_success;
 
-    offered += v.size();
-    // Remove requests that did not complete.
+    // Remove requests arrived during warm-up periods
     v.erase(std::remove_if(v.begin(), v.end(),
                         [](const work_unit &s) {
-                          return (s.duration_us == 0 ||
-                                 (s.start_us + s.duration_us) < kWarmUpTime);
+                          return ((s.start_us + s.duration_us) < kWarmUpTime);
+                        }),
+            v.end());
+
+    offered += v.size();
+    client_drop += std::count_if(v.begin(), v.end(), [](const work_unit &s) {
+      return (s.duration_us == 0);
+    });
+
+    // Remove local drops
+    v.erase(std::remove_if(v.begin(), v.end(),
+                        [](const work_unit &s) {
+                          return (s.duration_us == 0);
                         }),
             v.end());
     resp_success = std::count_if(v.begin(), v.end(), [](const work_unit &s) {
@@ -972,10 +1162,9 @@ std::vector<work_unit> RunExperiment(
   // Report results.
   if (csr) {
     csr->offered_rps = static_cast<double>(offered) / elapsed_ * 1000000;
-    csr->offered_rps *=
-        static_cast<double>(kExperimentTime - kWarmUpTime) / kExperimentTime;
     csr->rps = static_cast<double>(resps) / elapsed_ * 1000000;
     csr->goodput = static_cast<double>(good_resps) / elapsed_ * 1000000;
+    csr->req_dropped = client_drop;
     csr->min_percli_tput = min_throughput;
     csr->max_percli_tput = max_throughput;
   }
@@ -1037,6 +1226,10 @@ void PrintHeader(std::ostream &os) {
      << "p999,"
      << "p9999,"
      << "max,"
+     << "reject_min"
+     << "reject_mean"
+     << "reject_p50"
+     << "reject_p99"
      << "p1_credit,"
      << "mean_credit,"
      << "p99_credit,"
@@ -1075,64 +1268,7 @@ void PrintStatResults(std::vector<work_unit> w, struct cstat *cs,
               << "-" << std::endl;
     return;
   }
-/*
-  double cur_us = 2000000;
-  double gran_us = 20000;
-  int good_resp_cnt = 0;
-  uint64_t reject_sum_ = 0;
-  uint64_t reject_cnt_ = 0;
-  std::vector<double> durations;
 
-  // sort!
-  std::sort(w.begin(), w.end(), [](const work_unit &s1, const work_unit &s2) {
-    return (s1.start_us + s1.duration_us) < (s2.start_us + s2.duration_us);
-  });
-
-  for(const work_unit &s: w) {
-    double arr_us = s.start_us + s.duration_us;
-
-    if (arr_us < cur_us) continue;
-    if (arr_us >= cur_us + gran_us) {
-      cur_us += gran_us;
-
-      int duration_cnt = durations.size();
-      double time_s = cur_us / 1000000.0 - 2.0;
-      double goodput = 0.0;
-      double p99 = 0.0;
-      double reject_mean = 0.0;
-
-      if (duration_cnt > 0) {
-        std::sort(durations.begin(), durations.end(), [](const double &d1, const double &d2) {
-          return d1 < d2;
-        });
-	goodput = good_resp_cnt * (1000000 / gran_us);
-	p99 = durations[(duration_cnt - 1) * 0.99];
-      }
-
-      if (reject_cnt_ > 0) {
-        reject_mean = static_cast<double>(reject_sum_) / reject_cnt_;
-      }
-
-      printf("%lf,%lf,%lf\n", time_s, goodput,p99, reject_mean);
-
-      durations.clear();
-      good_resp_cnt = 0;
-      reject_sum_ = 0;
-      reject_cnt_ = 0;
-    }
-
-    if (!s.success) {
-      reject_cnt_++;
-      reject_sum_ += s.duration_us;
-      continue;
-    }
-
-    durations.push_back(s.duration_us);
-    if (s.duration_us <= slo) {
-      good_resp_cnt++;
-    }
-  }
-*/
   std::vector<work_unit> rejected;
 
   std::copy_if(w.begin(), w.end(), std::back_inserter(rejected), [](work_unit &s) {
@@ -1215,38 +1351,43 @@ void PrintStatResults(std::vector<work_unit> w, struct cstat *cs,
 
   std::cout << std::setprecision(4) << std::fixed << threads * total_agents << ","
 	    << cs->offered_rps << "," << cs->rps << "," << cs->goodput << ","
-	    << ss->cpu_usage << "," << min << "," << mean << "," << p50 << ","
-	    << p90 << "," << p99 << "," << p999 << "," << p9999 << ","
-	    << max << "," << reject_min << ","
-	    << reject_mean << "," << reject_p50 << ","
-	    << reject_p99 << "," << p1_credit << ","
-	    << mean_credit << "," << p99_credit << "," << p1_que << ","
+	    << ss->cpu_usage << ","
+	    << min << "," << mean << "," << p50 << "," << p90 << "," << p99 << ","
+	    << p999 << "," << p9999 << "," << max << ","
+	    << reject_min << "," << reject_mean << "," << reject_p50 << ","
+	    << reject_p99 << ","
+	    << p1_credit << "," << mean_credit << "," << p99_credit << ","
+	    << p1_que << ","
 	    << mean_que << "," << p99_que << "," << mean_stime << ","
 	    << p99_stime << "," << ss->rx_pps << "," << ss->tx_pps << ","
 	    << ss->rx_bps << "," << ss->tx_bps << "," << ss->rx_drops_pps << ","
 	    << ss->rx_ooo_pps << "," << ss->cupdate_rx_pps << ","
 	    << ss->ecredit_tx_pps << "," << ss->credit_tx_cps << ","
 	    << ss->req_rx_pps << "," << ss->req_drop_rate << ","
-	    << ss->resp_tx_pps << "," << cs->min_percli_tput << ","
-	    << cs->max_percli_tput << "," << cs->ecredit_rx_pps << ","
+	    << ss->resp_tx_pps << ","
+	    << cs->min_percli_tput << "," << cs->max_percli_tput << ","
+	    << cs->ecredit_rx_pps << "," << cs->cupdate_tx_pps << ","
 	    << cs->resp_rx_pps << "," << cs->req_tx_pps << ","
 	    << cs->credit_expired_cps << "," << cs->req_dropped_rps << std::endl;
 
   csv_out << std::setprecision(4) << std::fixed << threads * total_agents << ","
           << cs->offered_rps << "," << cs->rps << "," << cs->goodput << ","
-          << ss->cpu_usage << "," << min << "," << mean << "," << p50 << ","
-          << p90 << "," << p99 << "," << p999 << "," << p9999 << "," << max << ","
-	  << reject_min << "," << reject_mean << ","
-	  << reject_p50 << "," << reject_p99 << ","
-	  << p1_credit << "," << mean_credit << "," << p99_credit << "," << p1_que << ","
+          << ss->cpu_usage << ","
+	  << min << "," << mean << "," << p50 << "," << p90 << "," << p99 << ","
+	  << p999 << "," << p9999 << "," << max << ","
+	  << reject_min << "," << reject_mean << "," << reject_p50 << ","
+	  << reject_p99 << ","
+	  << p1_credit << "," << mean_credit << "," << p99_credit << ","
+	  << p1_que << ","
 	  << mean_que << "," << p99_que << "," << mean_stime << ","
 	  << p99_stime << "," << ss->rx_pps << "," << ss->tx_pps << ","
 	  << ss->rx_bps << "," << ss->tx_bps << "," << ss->rx_drops_pps << ","
 	  << ss->rx_ooo_pps << "," << ss->cupdate_rx_pps << ","
 	  << ss->ecredit_tx_pps << "," << ss->credit_tx_cps << ","
 	  << ss->req_rx_pps << "," << ss->req_drop_rate << ","
-	  << ss->resp_tx_pps << "," << cs->min_percli_tput << ","
-	  << cs->max_percli_tput << "," << cs->ecredit_rx_pps << ","
+	  << ss->resp_tx_pps << ","
+	  << cs->min_percli_tput << "," << cs->max_percli_tput << ","
+	  << cs->ecredit_rx_pps << "," << cs->cupdate_tx_pps << ","
 	  << cs->resp_rx_pps << "," << cs->req_tx_pps << ","
 	  << cs->credit_expired_cps << "," << cs->req_dropped_rps
 	  << std::endl << std::flush;
@@ -1265,10 +1406,10 @@ void PrintStatResults(std::vector<work_unit> w, struct cstat *cs,
            << "\"p999\":" << p999 << ","
            << "\"p9999\":" << p9999 << ","
            << "\"max\":" << max << ","
-	   << "\"rej_min_del\":" << reject_min << ","
-	   << "\"rej_mean_del\":" << reject_mean << ","
-	   << "\"rej_p50_del\":" << reject_p50 << ","
-	   << "\"rej_p99_del\":" << reject_p99 << ","
+	   << "\"reject_min\":" << reject_min << ","
+	   << "\"reject_mean\":" << reject_mean << ","
+	   << "\"reject_p50\":" << reject_p50 << ","
+	   << "\"reject_p99\":" << reject_p99 << ","
            << "\"p1_credit\":" << p1_credit << ","
            << "\"mean_credit\":" << mean_credit << ","
            << "\"p99_credit\":" << p99_credit << ","
@@ -1318,7 +1459,16 @@ void SteadyStateExperiment(int threads, double offered_rps,
         1.0 / (1000000.0 / (offered_rps / static_cast<double>(threads))));
     std::exponential_distribution<double> wd(1.0 / service_time);
     return GenerateWork(std::bind(rd, rg), std::bind(wd, dg), 0,
-                        kExperimentTime);
+                        kExperimentTime, false);
+  },
+  [=] {
+    std::mt19937 rg(rand());
+    std::mt19937 dg(rand());
+    std::exponential_distribution<double> rd(
+        1.0 / (1000000.0 / (offered_rps / static_cast<double>(threads))));
+    std::exponential_distribution<double> wd(1.0 / service_time);
+    return GenerateWork(std::bind(rd, rg), std::bind(wd, dg), 0,
+                        kExperimentTime, true);
   });
 
   if (b) {
@@ -1451,10 +1601,18 @@ int main(int argc, char *argv[]) {
     return -EINVAL;
   }
 
+  for (int i = 0; i < BOTTLENECK_N; ++i) {
+    mutex_init(&shared_mutex[i]);
+    spin_lock_init(&shared_spin[i]);
+  }
+
   std::string olc = argv[1]; // overload control
   if (olc.compare("breakwater") == 0) {
     crpc_ops = &cbw_ops;
     srpc_ops = &sbw_ops;
+  } else if (olc.compare("breakwater2") == 0) {
+    crpc_ops = &cbw_ops;
+    srpc_ops = &sbw2_ops;
   } else if (olc.compare("seda") == 0) {
     crpc_ops = &csd_ops;
     srpc_ops = &ssd_ops;
