@@ -24,10 +24,11 @@ struct mutex {
 
 typedef struct mutex mutex_t;
 
+extern uint64_t mutex_queue_tsc(mutex_t *m);
+extern uint64_t mutex_queue_us(mutex_t *m);
 extern void __mutex_lock(mutex_t *m);
 extern void __mutex_unlock(mutex_t *m);
 extern void mutex_init(mutex_t *m);
-extern uint64_t mutex_queue_us(mutex_t *m);
 
 /**
  * mutex_try_lock - attempts to acquire a mutex
@@ -101,6 +102,7 @@ extern void condvar_signal(condvar_t *cv);
 extern void condvar_broadcast(condvar_t *cv);
 extern void condvar_init(condvar_t *cv);
 
+extern uint64_t condvar_queue_tsc(condvar_t *cv);
 extern uint64_t condvar_queue_us(condvar_t *cv);
 
 

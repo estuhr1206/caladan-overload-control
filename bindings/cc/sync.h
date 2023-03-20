@@ -164,6 +164,8 @@ class Mutex {
   // Unlocks the mutex.
   void Unlock() { mutex_unlock(&mu_); }
 
+  uint64_t QueueUS() { return mutex_queue_us(&mu_); }
+
   // Locks the mutex only if it is currently unlocked. Returns true if
   // successful.
   bool TryLock() { return mutex_try_lock(&mu_); }
@@ -247,6 +249,8 @@ class CondVar {
   // Wake up all waiters.
   void SignalAll() { condvar_broadcast(&cv_); }
 
+  uint64_t QueueUS() { return condvar_queue_us(&cv_); }
+
  private:
   condvar_t cv_;
 
@@ -266,7 +270,7 @@ class WaitGroup {
     waitgroup_add(&wg_, count);
   }
 
-  ~WaitGroup() { assert(wg_.cnt == 0); };
+  ~WaitGroup() { assert(wg_.cnt == 0); }
 
   // Changes the number of jobs (can be negative).
   void Add(int count) { waitgroup_add(&wg_, count); }

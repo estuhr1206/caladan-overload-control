@@ -17,6 +17,29 @@
 
 #define WAITER_FLAG (1 << 31)
 
+/**
+ * mutex_queue_tsc - returns mutex queueing delay
+ * @m: the mutex to get queueing delay
+ */
+uint64_t mutex_queue_tsc(mutex_t *m)
+{
+	uint64_t cur_tsc = rdtsc();
+	if (cur_tsc < m->oldest_tsc) {
+		return 0;
+	}
+
+	return (cur_tsc - m->oldest_tsc);
+}
+
+/**
+ * mutex_queue_us - returns mutex queueing delay in us
+ * @m: the mutex to get queueing delay
+ */
+uint64_t mutex_queue_us(mutex_t *m)
+{
+	return mutex_queue_tsc(m) / cycles_per_us;
+}
+
 void __mutex_lock(mutex_t *m)
 {
 	thread_t *myth;
@@ -33,6 +56,7 @@ void __mutex_lock(mutex_t *m)
 	myth = thread_self();
 	bool is_first = list_empty(&m->waiters);
 	myth->ready_tsc = rdtsc();
+	myth->enque_ts = myth->ready_tsc;
 	list_add_tail(&m->waiters, &myth->link);
 	if (is_first)
 		m->oldest_tsc = myth->ready_tsc;
@@ -60,6 +84,7 @@ void __mutex_unlock(mutex_t *m)
 		m->oldest_tsc = oldest_th->ready_tsc;
 	}
 	spin_unlock_np(&m->waiter_lock);
+	waketh->acc_qdel += (rdtsc() - waketh->enque_ts);
 	thread_ready(waketh);
 }
 
@@ -75,19 +100,6 @@ void mutex_init(mutex_t *m)
 	m->oldest_tsc = UINT64_MAX;
 }
 
-/**
- * mutex_queue_us - returns mutex queueing delay
- * @m: the mutex to get queueing delay
- */
-uint64_t mutex_queue_us(mutex_t *m)
-{
-	uint64_t cur_tsc = rdtsc();
-	if (cur_tsc < m->oldest_tsc) {
-		return 0;
-	} else {
-		return (cur_tsc - m->oldest_tsc) / cycles_per_us;
-	}
-}
 
 /*
  * Read-write mutex support
@@ -247,6 +259,7 @@ void condvar_wait(condvar_t *cv, mutex_t *m)
 	mutex_unlock(m);
 	bool is_first = list_empty(&cv->waiters);
 	myth->ready_tsc = rdtsc();
+	myth->enque_ts = myth->ready_tsc;
 	list_add_tail(&cv->waiters, &myth->link);
 	if (is_first)
 		cv->oldest_tsc = myth->ready_tsc;
@@ -265,7 +278,7 @@ static void condvar_timed_wait_expired(unsigned long args) {
 		(struct condvar_timed_wait_args *)args;
 	thread_t *th = t_args->th;
 	condvar_t *cv = t_args->cv;
-	thread_t *waiter;
+	thread_t *waiter = NULL;
 
 	// see if still th is in the waiter lists
 	spin_lock_np(&cv->waiter_lock);
@@ -283,8 +296,10 @@ static void condvar_timed_wait_expired(unsigned long args) {
 	}
 	spin_unlock_np(&cv->waiter_lock);
 
-	if (waiter == th)
+	if (waiter == th) {
+		th->acc_qdel += (rdtsc() - th->enque_ts);
 		thread_ready(th);
+	}
 }
 
 /**
@@ -331,8 +346,10 @@ void condvar_signal(condvar_t *cv)
 		cv->oldest_tsc = oldest_th->ready_tsc;
 	}
 	spin_unlock_np(&cv->waiter_lock);
-	if (waketh)
+	if (waketh) {
+		waketh->acc_qdel += (rdtsc() - waketh->enque_ts);
 		thread_ready(waketh);
+	}
 }
 
 /**
@@ -355,6 +372,7 @@ void condvar_broadcast(condvar_t *cv)
 		waketh = list_pop(&tmp, thread_t, link);
 		if (!waketh)
 			break;
+		waketh->acc_qdel += (rdtsc() - waketh->enque_ts);
 		thread_ready(waketh);
 	}
 }
@@ -371,17 +389,25 @@ void condvar_init(condvar_t *cv)
 }
 
 /**
- * condvar_queue_us - returns queueing delay of condvar
+ * condvar_queue_tsc - returns condvar queueing delay
+ * @cv: the condvar to get queueing delay
+ */
+uint64_t condvar_queue_tsc(condvar_t *cv)
+{
+	uint64_t cur_tsc = rdtsc();
+	if (cur_tsc < cv->oldest_tsc)
+		return 0;
+
+	return (cur_tsc - cv->oldest_tsc);
+}
+
+/**
+ * condvar_queue_tsc - returns condvar queueing delay in us
  * @cv: the condvar to get queueing delay
  */
 uint64_t condvar_queue_us(condvar_t *cv)
 {
-	uint64_t cur_tsc = rdtsc();
-	if (cur_tsc < cv->oldest_tsc) {
-		return 0;
-	} else {
-		return (cur_tsc - cv->oldest_tsc) / cycles_per_us;
-	}
+	return condvar_queue_tsc(cv) / cycles_per_us;
 }
 
 

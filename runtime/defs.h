@@ -100,6 +100,7 @@ struct thread {
 	uint64_t		ready_tsc;
 	uint64_t		tlsvar;
 	uint64_t		acc_qdel;
+	uint64_t		enque_ts;
 #ifdef GC
 	struct list_node	gc_link;
 	unsigned int		onk;
