@@ -470,6 +470,7 @@ ssize_t csd_recv_one(struct crpc_conn *cc_, void *buf, size_t len, void *arg)
 	uint64_t now;
 	uint64_t us;
 
+again:
 	/* read the server header */
 	ret = tcp_read_full(cc->cmn.c, &shdr, sizeof(shdr));
 	if (unlikely(ret <= 0))
@@ -490,14 +491,15 @@ ssize_t csd_recv_one(struct crpc_conn *cc_, void *buf, size_t len, void *arg)
 	now = microtime();
 	switch (shdr.op) {
 	case SD_OP_CALL:
-		/* read the payload */
-		if (shdr.len > 0) {
-			ret = tcp_read_full(cc->cmn.c, buf, shdr.len);
-			if (unlikely(ret <= 0))
-				return ret;
-			assert(ret == shdr.len);
-			cc->resp_rx_++;
-		}
+		// ignore dropped requests
+		if (shdr.len == 0)
+			goto again;
+
+		ret = tcp_read_full(cc->cmn.c, buf, shdr.len);
+		if (unlikely(ret <= 0))
+			return ret;
+		assert(ret == shdr.len);
+		cc->resp_rx_++;
 
 		us = now - shdr.ts;
 
@@ -523,7 +525,8 @@ ssize_t csd_recv_one(struct crpc_conn *cc_, void *buf, size_t len, void *arg)
 
 
 int csd_open(struct netaddr raddr, struct crpc_session **sout, int id,
-	     crpc_ldrop_fn_t ldrop_handler, crpc_rdrop_fn_t rdrop_handler)
+	     crpc_ldrop_fn_t ldrop_handler, crpc_rdrop_fn_t rdrop_handler,
+	     struct rpc_session_info *info)
 {
 	struct netaddr laddr;
 	struct csd_session *s;
@@ -541,6 +544,11 @@ int csd_open(struct netaddr raddr, struct crpc_session **sout, int id,
 	/* dial */
 	ret = tcp_dial(laddr, raddr, &c);
 	if (ret)
+		return ret;
+
+	/* send session info */
+	ret = tcp_write_full(c, info, sizeof(*info));
+	if (unlikely(ret < 0))
 		return ret;
 
 	/* alloc session */
@@ -587,6 +595,7 @@ int csd_open(struct netaddr raddr, struct crpc_session **sout, int id,
 	/* init session */
 	s->cmn.nconns = 1;
 	s->cmn.c[0] = (struct crpc_conn *)cc;
+	s->cmn.session_type = info->session_type;
 	s->id = id;
 	s->req_id = 1;
 

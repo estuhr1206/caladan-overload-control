@@ -8,18 +8,22 @@
 #include <runtime/tcp.h>
 
 /*
- * Stats data structures
+ * Information shared between client - server
  */
+struct rpc_session_info {
+	int			session_type;
+};
 
 /*
  * Server API
  */
 
 #define SRPC_PORT	8123
-#define SRPC_BUF_SIZE	4096
+#define SRPC_BUF_SIZE	2048
 
 struct srpc_session {
 	tcpconn_t		*c;
+	int			session_type;
 };
 
 struct srpc_ctx {
@@ -31,7 +35,9 @@ struct srpc_ctx {
 	char			req_buf[SRPC_BUF_SIZE];
 	char			resp_buf[SRPC_BUF_SIZE];
 	bool			drop;
+	bool			track;
 	uint64_t		ds_credit;
+	bool			should_put;
 };
 
 typedef void (*srpc_fn_t)(struct srpc_ctx *ctx);
@@ -44,6 +50,7 @@ struct srpc_ops {
 	 * Returns 0 if successful.
 	 */
 	int (*srpc_enable)(srpc_fn_t handler);
+	void (*srpc_drop)();
 
 	uint64_t (*srpc_stat_cupdate_rx)();
 	uint64_t (*srpc_stat_ecredit_tx)();
@@ -81,6 +88,7 @@ struct crpc_session {
 	int			nconns;
 	crpc_ldrop_fn_t		ldrop_handler;
 	crpc_rdrop_fn_t		rdrop_handler;
+	int			session_type;
 };
 
 struct crpc_ops {
@@ -133,7 +141,8 @@ struct crpc_ops {
 	 */
 	int (*crpc_open)(struct netaddr raddr, struct crpc_session **sout,
 			 int id, crpc_ldrop_fn_t ldrop_handler,
-			 crpc_rdrop_fn_t rdrop_handler);
+			 crpc_rdrop_fn_t rdrop_handler,
+			 struct rpc_session_info *info);
 
 	/**
 	 * crpc_close - closes an RPC session
@@ -160,6 +169,7 @@ struct crpc_ops {
 extern const struct srpc_ops *srpc_ops;
 extern const struct crpc_ops *crpc_ops;
 extern struct srpc_ops sbw_ops;
+extern struct srpc_ops sbw2_ops;
 extern struct crpc_ops cbw_ops;
 extern struct srpc_ops ssd_ops;
 extern struct crpc_ops csd_ops;

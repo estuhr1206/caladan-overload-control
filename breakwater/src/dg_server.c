@@ -413,6 +413,7 @@ static void srpc_server(void *arg)
 {
 	tcpconn_t *c = (tcpconn_t *)arg;
 	struct sdg_session *s;
+	struct rpc_session_info info;
 	thread_t *th;
 	int ret;
 
@@ -420,7 +421,12 @@ static void srpc_server(void *arg)
 	BUG_ON(!s);
 	memset(s, 0, sizeof(*s));
 
+	/* receive session info */
+	ret = tcp_read_full(c, &info, sizeof(info));
+	BUG_ON(ret <= 0);
+
 	s->cmn.c = c;
+	s->cmn.session_type = info.session_type;
 	s->id = atomic_fetch_and_add(&srpc_num_sess, 1) + 1;
 	bitmap_init(s->avail_slots, SDG_MAX_WINDOW, true);
 

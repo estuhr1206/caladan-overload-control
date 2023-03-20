@@ -513,7 +513,8 @@ done:
 }
 
 int cbw_open(struct netaddr raddr, struct crpc_session **sout, int id,
-	     crpc_ldrop_fn_t ldrop_handler, crpc_rdrop_fn_t rdrop_handler)
+	     crpc_ldrop_fn_t ldrop_handler, crpc_rdrop_fn_t rdrop_handler,
+	     struct rpc_session_info *info)
 {
 	struct netaddr laddr;
 	struct cbw_session *s;
@@ -531,6 +532,11 @@ int cbw_open(struct netaddr raddr, struct crpc_session **sout, int id,
 	/* dial */
 	ret = tcp_dial(laddr, raddr, &c);
 	if (ret)
+		return ret;
+
+	/* send session info */
+	ret = tcp_write_full(c, info, sizeof(*info));
+	if (unlikely(ret < 0))
 		return ret;
 
 	/* alloc session */
@@ -563,6 +569,7 @@ int cbw_open(struct netaddr raddr, struct crpc_session **sout, int id,
 	s->cmn.c[0] = (struct crpc_conn *)cc;
 	s->cmn.ldrop_handler = ldrop_handler;
 	s->cmn.rdrop_handler = rdrop_handler;
+	s->cmn.session_type = info->session_type;
 	s->running = true;
 	s->id = id;
 	s->req_id = 1;

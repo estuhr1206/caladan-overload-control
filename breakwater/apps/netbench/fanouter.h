@@ -106,6 +106,7 @@ FanOuter<T, ID_OFF>::FanOuter(netaddr *raddrs, int nserver,
   clients_ = (RpcClient **)malloc(sizeof(RpcClient*) * nserver * nclients);
 
   int sidx, cidx;
+  struct rpc_session_info info = {.session_type = 0};
   for (int i = 0; i < nserver * nclients; ++i) {
     // server index
     sidx = i / nclients;
@@ -114,7 +115,7 @@ FanOuter<T, ID_OFF>::FanOuter(netaddr *raddrs, int nserver,
 
     // Dial to the first connection
     clients_[i] = RpcClient::Dial(raddrs[sidx], i + 1, ldrop_handler,
-				  rdrop_handler);
+				  rdrop_handler, &info);
 
     // Add connection
     for (int j = 0; j < nconns - 1; ++j) {

@@ -14,11 +14,12 @@ void RpcServerTrampoline(struct srpc_ctx *arg) {
 
 RpcClient *RpcClient::Dial(netaddr raddr, int id,
 			   crpc_ldrop_fn_t ldrop_handler,
-			   crpc_rdrop_fn_t rdrop_handler) {
+			   crpc_rdrop_fn_t rdrop_handler,
+			   struct rpc_session_info *info) {
   crpc_session *s;
   raddr.port = SRPC_PORT;
   int ret = crpc_ops->crpc_open(raddr, &s, id, ldrop_handler,
-				rdrop_handler);
+				rdrop_handler, info);
   if (ret) return nullptr;
   return new RpcClient(s);
 }

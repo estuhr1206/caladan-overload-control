@@ -9,6 +9,8 @@ CXXFLAGS += -I$(ROOT_PATH)/breakwater/bindings/cc/inc
 bw_src = rpc++.cc
 bw_obj = $(bw_src:.cc=.o)
 
+INC += -I$(ROOT_PATH)/bindings
+
 all: libbw++.a
 
 libbw++.a: $(bw_obj)

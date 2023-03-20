@@ -23,7 +23,8 @@ class RpcClient {
   // Creates an RPC session.
   static RpcClient *Dial(netaddr raddr, int id,
 			 crpc_ldrop_fn_t ldrop_handler,
-			 crpc_rdrop_fn_t rdrop_handler);
+			 crpc_rdrop_fn_t rdrop_handler,
+			 struct rpc_session_info *info);
 
   int AddConnection(netaddr raddr);
 

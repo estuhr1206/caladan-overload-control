@@ -82,10 +82,11 @@ LoadBalancer<T, ID_OFF>::LoadBalancer(netaddr *raddrs, int nserver,
   clients_ = (RpcClient **)malloc(sizeof(RpcClient*) * nclients);
 
   int sidx, cidx;
+  struct rpc_session_info info = {.session_type = 0};
   for (int i = 0; i < nclients; ++i) {
     // Dial to the first connection (Note Dial returns a new Client)
     // TODO: DropHandler
-    clients_[i] = RpcClient::Dial(raddrs[0], 1, ldrop_handler, rdrop_handler);
+    clients_[i] = RpcClient::Dial(raddrs[0], 1, ldrop_handler, rdrop_handler, &info);
 
     // Add connections to the replicas
     if (nconns > 1) {

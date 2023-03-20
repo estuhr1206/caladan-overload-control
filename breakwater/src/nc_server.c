@@ -214,6 +214,8 @@ static void srpc_worker(void *arg)
 	uint64_t st = microtime();
 	thread_t *th;
 
+	c->cmn.drop = false;
+
 	srpc_handler((struct srpc_ctx *)c);
 	st = microtime() - st;
 
@@ -224,6 +226,10 @@ static void srpc_worker(void *arg)
 	th = s->sender_th;
 	s->sender_th = NULL;
 	spin_unlock_np(&s->lock);
+
+	if (c->cmn.drop)
+		atomic64_inc(&srpc_stat_req_dropped_);
+
 	if (th)
 		thread_ready(th);
 }
@@ -390,6 +396,7 @@ static void srpc_server(void *arg)
 {
 	tcpconn_t *c = (tcpconn_t *)arg;
 	struct snc_session *s;
+	struct rpc_session_info info;
 	thread_t *th;
 	int ret;
 
@@ -397,7 +404,12 @@ static void srpc_server(void *arg)
 	BUG_ON(!s);
 	memset(s, 0, sizeof(*s));
 
+	/* receive session info */
+	ret = tcp_read_full(c, &info, sizeof(info));
+	BUG_ON(ret <= 0);
+
 	s->cmn.c = c;
+	s->cmn.session_type = info.session_type;
 	s->id = atomic_fetch_and_add(&srpc_num_sess, 1) + 1;
 	bitmap_init(s->avail_slots, SNC_MAX_WINDOW, true);
 
@@ -492,6 +504,12 @@ int snc_enable(srpc_fn_t handler)
 	return 0;
 }
 
+void snc_drop()
+{
+        struct srpc_ctx *ctx = (struct srpc_ctx *)get_rpc_ctx();
+	ctx->drop = true;
+}
+
 uint64_t snc_stat_cupdate_rx()
 {
 	return 0;
@@ -524,6 +542,7 @@ uint64_t snc_stat_resp_tx()
 
 struct srpc_ops snc_ops = {
 	.srpc_enable		= snc_enable,
+	.srpc_drop		= snc_drop,
 	.srpc_stat_cupdate_rx	= snc_stat_cupdate_rx,
 	.srpc_stat_ecredit_tx	= snc_stat_ecredit_tx,
 	.srpc_stat_credit_tx	= snc_stat_credit_tx,

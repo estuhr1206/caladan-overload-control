@@ -20,6 +20,7 @@
 
 #include "util.h"
 #include "sd_proto.h"
+#include "bw2_config.h"
 
 /* the maximum supported window size */
 #define SSD_MAX_WINDOW_EXP	6
@@ -213,16 +214,37 @@ static void srpc_worker(void *arg)
 	uint64_t st = microtime();
 	thread_t *th;
 
+	set_rpc_ctx((void *)&c->cmn);
+	set_acc_qdel(runtime_queue_us() * cycles_per_us);
+	c->cmn.drop = (get_acc_qdel_us() > SBW_LATENCY_BUDGET);
+
+	if (!c->cmn.drop) {
+		srpc_handler((struct srpc_ctx *)c);
+	}
+
+	if (!c->cmn.drop) {
+		st = microtime() - st;
+		srpc_avg_st = (int)((1 - EWMA_WEIGHT) * srpc_avg_st + EWMA_WEIGHT * st);
+	}
+
+
+	/*
+	c->cmn.drop = false;
+
 	srpc_handler((struct srpc_ctx *)c);
 	st = microtime() - st;
 
 	srpc_avg_st = (int)((1 - EWMA_WEIGHT) * srpc_avg_st + EWMA_WEIGHT * st);
-
+	*/
 	spin_lock_np(&s->lock);
 	bitmap_set(s->completed_slots, c->cmn.idx);
 	th = s->sender_th;
 	s->sender_th = NULL;
 	spin_unlock_np(&s->lock);
+
+	if (c->cmn.drop)
+		atomic64_inc(&srpc_stat_req_dropped_);
+
 	if (th)
 		thread_ready(th);
 }
@@ -372,6 +394,7 @@ static void srpc_server(void *arg)
 {
 	tcpconn_t *c = (tcpconn_t *)arg;
 	struct ssd_session *s;
+	struct rpc_session_info info;
 	thread_t *th;
 	int ret;
 
@@ -379,7 +402,12 @@ static void srpc_server(void *arg)
 	BUG_ON(!s);
 	memset(s, 0, sizeof(*s));
 
+	/* receive session info */
+	ret = tcp_read_full(c, &info, sizeof(info));
+	BUG_ON(ret <= 0);
+
 	s->cmn.c = c;
+	s->cmn.session_type = info.session_type;
 	s->id = atomic_fetch_and_add(&srpc_num_sess, 1) + 1;
 	bitmap_init(s->avail_slots, SSD_MAX_WINDOW, true);
 
@@ -474,6 +502,12 @@ int ssd_enable(srpc_fn_t handler)
 	return 0;
 }
 
+void ssd_drop()
+{
+        struct srpc_ctx *ctx = (struct srpc_ctx *)get_rpc_ctx();
+	ctx->drop = true;
+}
+
 uint64_t ssd_stat_cupdate_rx()
 {
 	return 0;
@@ -506,6 +540,7 @@ uint64_t ssd_stat_resp_tx()
 
 struct srpc_ops ssd_ops = {
 	.srpc_enable		= ssd_enable,
+	.srpc_drop		= ssd_drop,
 	.srpc_stat_cupdate_rx	= ssd_stat_cupdate_rx,
 	.srpc_stat_ecredit_tx	= ssd_stat_ecredit_tx,
 	.srpc_stat_credit_tx	= ssd_stat_credit_tx,

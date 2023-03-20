@@ -21,6 +21,7 @@
 #include "util.h"
 #include "bw_proto.h"
 #include "bw_config.h"
+#include "bw2_config.h"
 
 /* time-series output */
 #define SBW_TS_OUT		false
@@ -104,7 +105,6 @@ BUILD_ASSERT(sizeof(struct srpc_drained_) == CACHE_LINE_SIZE);
 static struct srpc_drained_ srpc_drained[NCPU]
 		__attribute__((aligned(CACHE_LINE_SIZE)));
 
-
 struct sbw_session {
 	struct srpc_session	cmn;
 	int			id;
@@ -174,14 +174,14 @@ static void record(int credit_pool, uint64_t delay)
 
 	event->timestamp = microtime();
 	event->credit_pool = credit_pool;
-	event->credit_used = atomic_read(&srpc_credit_used);
-	event->num_pending = atomic_read(&srpc_num_pending);
-	event->num_drained = atomic_read(&srpc_num_drained);
-	event->num_active = atomic_read(&srpc_num_active);
-	event->num_sess = atomic_read(&srpc_num_sess);
+	event->credit_used = atomic_read(&srpc_credit_used[0]);
+	event->num_pending = atomic_read(&srpc_num_pending[0]);
+	event->num_drained = atomic_read(&srpc_num_drained[0]);
+	event->num_active = atomic_read(&srpc_num_active[0]);
+	event->num_sess = atomic_read(&srpc_num_sess[0]);
 	event->delay = delay;
 	event->num_cores = runtime_active_cores();
-	event->avg_st = atomic_read(&srpc_avg_st);
+	event->avg_st = atomic_read(&srpc_avg_st[0]);
 
 	if (nextIndex == 0)
 		printRecord();
@@ -365,15 +365,12 @@ static void srpc_update_credit(struct sbw_session *s, bool req_dropped)
 /* srpc_choose_drained_h: choose a drained session with high priority */
 static struct sbw_session *srpc_choose_drained_h(int core_id)
 {
-	struct sbw_session *ret;
 	struct sbw_session *s;
 	uint64_t now = microtime();
 	int demand_timeout = MAX(CBW_MAX_CLIENT_DELAY_US - SBW_RTT_US, 0);
 
 	assert(core_id >= 0);
 	assert(core_id < runtime_max_cores());
-
-	ret = NULL;
 
 	if (list_empty(&srpc_drained[core_id].list_h))
 		return NULL;
@@ -406,30 +403,28 @@ static struct sbw_session *srpc_choose_drained_h(int core_id)
 		return NULL;
 	}
 
-	ret = list_pop(&srpc_drained[core_id].list_h,
-		       struct sbw_session,
-		       drained_link);
+	s = list_pop(&srpc_drained[core_id].list_h,
+		     struct sbw_session,
+		     drained_link);
 
-	BUG_ON(!ret->is_linked);
-	ret->is_linked = false;
+	BUG_ON(!s->is_linked);
+	s->is_linked = false;
 	spin_unlock_np(&srpc_drained[core_id].lock);
-	spin_lock_np(&ret->lock);
-	ret->drained_core = -1;
-	spin_unlock_np(&ret->lock);
+	spin_lock_np(&s->lock);
+	s->drained_core = -1;
+	spin_unlock_np(&s->lock);
 	atomic_dec(&srpc_num_drained);
 
-	return ret;
+	return s;
 }
 
 /* srpc_choose_drained_l: choose a drained session with low priority */
 static struct sbw_session *srpc_choose_drained_l(int core_id)
 {
-	struct sbw_session *ret;
+	struct sbw_session *s;
 
 	assert(core_id >= 0);
 	assert(core_id < runtime_max_cores());
-
-	ret = NULL;
 
 	if (list_empty(&srpc_drained[core_id].list_l))
 		return NULL;
@@ -440,24 +435,24 @@ static struct sbw_session *srpc_choose_drained_l(int core_id)
 		return NULL;
 	}
 
-	ret = list_pop(&srpc_drained[core_id].list_l,
-		       struct sbw_session,
-		       drained_link);
+	s = list_pop(&srpc_drained[core_id].list_l,
+		     struct sbw_session,
+		     drained_link);
 
-	assert(ret->is_linked);
-	ret->is_linked = false;
+	assert(s->is_linked);
+	s->is_linked = false;
 	spin_unlock_np(&srpc_drained[core_id].lock);
-	spin_lock_np(&ret->lock);
-	ret->drained_core = -1;
-	spin_unlock_np(&ret->lock);
+	spin_lock_np(&s->lock);
+	s->drained_core = -1;
+	spin_unlock_np(&s->lock);
 	atomic_dec(&srpc_num_drained);
 #if SBW_TRACK_FLOW
-	if (ret->id == SBW_TRACK_FLOW_ID) {
+	if (s->id == SBW_TRACK_FLOW_ID) {
 		printf("[%lu] Session waken up\n", microtime());
 	}
 #endif
 
-	return ret;
+	return s;
 }
 
 static void srpc_remove_from_drained_list(struct sbw_session *s)
@@ -487,10 +482,11 @@ static void srpc_remove_from_drained_list(struct sbw_session *s)
  *
  * @ qus: queueing delay in us
  * */
-static int decr_credit_pool (uint64_t qus)
+static int decr_credit_pool(uint64_t qus)
 {
 	float alpha;
 	int credit_pool = atomic_read(&srpc_credit_pool);
+	int num_sess = atomic_read(&srpc_num_sess);
 
 	alpha = (qus - SBW_DELAY_TARGET) / (float)SBW_DELAY_TARGET;
 	alpha = alpha * SBW_MD;
@@ -537,38 +533,38 @@ static void wakeup_drained_session(int num_session)
 	unsigned int i;
 	unsigned int core_id = get_current_affinity();
 	unsigned int max_cores = runtime_max_cores();
-	struct sbw_session *ws;
+	struct sbw_session *s;
 	thread_t *th;
 
 	while (num_session > 0) {
-		ws = srpc_choose_drained_h(core_id);
+		s = srpc_choose_drained_h(core_id);
 
 		i = (core_id + 1) % max_cores;
-		while (!ws && i != core_id) {
-			ws = srpc_choose_drained_h(i);
+		while (!s && i != core_id) {
+			s = srpc_choose_drained_h(i);
 			i = (i + 1) % max_cores;
 		}
 
-		if (!ws) {
-			ws = srpc_choose_drained_l(core_id);
+		if (!s) {
+			s = srpc_choose_drained_l(core_id);
 
 			i = (core_id + 1) % max_cores;
-			while (!ws && i != core_id) {
-				ws = srpc_choose_drained_l(i);
+			while (!s && i != core_id) {
+				s = srpc_choose_drained_l(i);
 				i = (i + 1) % max_cores;
 			}
 		}
 
-		if (!ws)
+		if (!s)
 			break;
 
-		spin_lock_np(&ws->lock);
-		BUG_ON(ws->credit > 0);
-		th = ws->sender_th;
-		ws->sender_th = NULL;
-		ws->wake_up = true;
-		ws->credit = 1;
-		spin_unlock_np(&ws->lock);
+		spin_lock_np(&s->lock);
+		BUG_ON(s->credit > 0);
+		th = s->sender_th;
+		s->sender_th = NULL;
+		s->wake_up = true;
+		s->credit = 1;
+		spin_unlock_np(&s->lock);
 
 		atomic_inc(&srpc_credit_used);
 
@@ -590,11 +586,14 @@ static void srpc_update_credit_pool()
 		return;
 
 	srpc_last_cp_update = now;
+
 	qus = runtime_queue_us();
+	new_cp = atomic_read(&srpc_credit_pool);
 	credit_used = atomic_read(&srpc_credit_used);
 
 	if (qus >= SBW_DELAY_TARGET)
 		new_cp = decr_credit_pool(qus);
+	//else if (credit_used >= new_cp)
 	else
 		new_cp = incr_credit_pool(qus);
 
@@ -623,8 +622,8 @@ static void srpc_handle_req_drop(uint64_t qus)
 
 	srpc_last_cp_update = now;
 	new_cp = decr_credit_pool(qus);
-
 	atomic_write(&srpc_credit_pool, new_cp);
+
 #if SBW_TS_OUT
 	record(new_cp, qus);
 #endif
@@ -638,16 +637,37 @@ static void srpc_worker(void *arg)
 	uint64_t avg_st;
 	thread_t *th;
 
+	set_rpc_ctx((void *)&c->cmn);
+	set_acc_qdel(runtime_queue_us() * cycles_per_us);
+	c->cmn.drop = (get_acc_qdel_us() > SBW_LATENCY_BUDGET);
+
+	if (!c->cmn.drop) {
+		service_time = microtime();
+		srpc_handler((struct srpc_ctx *)c);
+	}
+
+	if (!c->cmn.drop) {
+		service_time = microtime() - service_time;
+		avg_st = atomic_read(&srpc_avg_st);
+		avg_st = (uint64_t)(avg_st - (avg_st >> 3) + (service_time >> 3));
+
+		atomic_write(&srpc_avg_st, avg_st);
+		atomic_write(&srpc_credit_ds, c->cmn.ds_credit);
+	}
+/*
 	c->cmn.drop = false;
-	service_time = microtime();
-	srpc_handler((struct srpc_ctx *)c);
-	service_time = microtime() - service_time;
-	avg_st = atomic_read(&srpc_avg_st);
-	avg_st = (uint64_t)(avg_st - (avg_st >> 3) + (service_time >> 3));
 
-	atomic_write(&srpc_avg_st, avg_st);
-	atomic_write(&srpc_credit_ds, c->cmn.ds_credit);
+	if (!c->cmn.drop) {
+		service_time = microtime();
+		srpc_handler((struct srpc_ctx *)c);
+		service_time = microtime() - service_time;
+		avg_st = atomic_read(&srpc_avg_st);
+		avg_st = (uint64_t)(avg_st - (avg_st >> 3) + (service_time >> 3));
 
+		atomic_write(&srpc_avg_st, avg_st);
+		atomic_write(&srpc_credit_ds, c->cmn.ds_credit);
+	}
+*/
 	spin_lock_np(&s->lock);
 	bitmap_set(s->completed_slots, c->cmn.idx);
 	th = s->sender_th;
@@ -655,7 +675,10 @@ static void srpc_worker(void *arg)
 	spin_unlock_np(&s->lock);
 
 	// update credit pool
-	srpc_update_credit_pool();
+	if (!c->cmn.drop)
+		srpc_update_credit_pool();
+	else
+		atomic64_inc(&srpc_stat_req_dropped_);
 
 	if (th)
 		thread_ready(th);
@@ -734,7 +757,7 @@ again:
 		atomic_inc(&srpc_num_pending);
 
 		us = runtime_queue_us();
-		if (SBW_DROP_THRESH > 0 && us >= SBW_DROP_THRESH) {
+		if (us >= SBW_DROP_THRESH) {
 			thread_t *th;
 
 			// precedure called when the incoming request is dropped
@@ -790,6 +813,7 @@ again:
 			// s->demand == 0
 			// push the session to the low priority drained queue
 			unsigned int core_id = get_current_affinity();
+
 			spin_lock_np(&srpc_drained[core_id].lock);
 			BUG_ON(s->is_linked);
 			BUG_ON(s->credit > 0);
@@ -981,6 +1005,7 @@ static void srpc_server(void *arg)
 {
 	tcpconn_t *c = (tcpconn_t *)arg;
 	struct sbw_session *s;
+	struct rpc_session_info info;
 	thread_t *th;
 	int ret;
 
@@ -988,7 +1013,12 @@ static void srpc_server(void *arg)
 	BUG_ON(!s);
 	memset(s, 0, sizeof(*s));
 
+	/* receive session info */
+	ret = tcp_read_full(c, &info, sizeof(info));
+	BUG_ON(ret <= 0);
+
 	s->cmn.c = c;
+	s->cmn.session_type = 0;
 	s->drained_core = -1;
 	s->id = atomic_fetch_and_add(&srpc_num_sess, 1) + 1;
 	bitmap_init(s->avail_slots, SBW_MAX_WINDOW, true);
@@ -1022,7 +1052,6 @@ static void srpc_server(void *arg)
 	atomic_sub_and_fetch(&srpc_num_pending, s->num_pending);
 	s->num_pending = 0;
 	s->demand = 0;
-	s->credit = 0;
 	spin_unlock_np(&s->lock);
 
 	if (th)
@@ -1038,6 +1067,7 @@ static void srpc_server(void *arg)
 		assert(atomic_read(&srpc_credit_used) == 0);
 		assert(atomic_read(&srpc_num_drained) == 0);
 		atomic_write(&srpc_credit_used, 0);
+		//atomic_write(&srpc_credit_pool, runtime_max_cores());
 		atomic_write(&srpc_credit_pool, runtime_max_cores());
 		srpc_last_cp_update = microtime();
 		atomic_write(&srpc_credit_ds, 0);
@@ -1047,13 +1077,14 @@ static void srpc_server(void *arg)
 
 static void srpc_listener(void *arg)
 {
+	waitgroup_t *wg_listener = (waitgroup_t *)arg;
 	struct netaddr laddr;
 	tcpconn_t *c;
 	tcpqueue_t *q;
 	int ret;
 	int i;
 
-	for (i = 0 ; i < NCPU ; ++i) {
+	for (i = 0; i < NCPU; ++i) {
 		spin_lock_init(&srpc_drained[i].lock);
 		list_head_init(&srpc_drained[i].list_h);
 		list_head_init(&srpc_drained[i].list_l);
@@ -1061,13 +1092,14 @@ static void srpc_listener(void *arg)
 
 	atomic_write(&srpc_num_sess, 0);
 	atomic_write(&srpc_num_drained, 0);
-
 	atomic_write(&srpc_credit_pool, runtime_max_cores());
-	srpc_last_cp_update = microtime();
 	atomic_write(&srpc_credit_used, 0);
-	atomic_write(&srpc_credit_ds, 0);
 	atomic_write(&srpc_num_pending, 0);
+	atomic_write(&srpc_credit_ds, 0);
 	atomic_write(&srpc_avg_st, 0);
+	credit_carry = 0.0;
+
+	srpc_last_cp_update = microtime();
 
 	/* init stats */
 	atomic64_write(&srpc_stat_cupdate_rx_, 0);
@@ -1075,13 +1107,13 @@ static void srpc_listener(void *arg)
 	atomic64_write(&srpc_stat_req_rx_, 0);
 	atomic64_write(&srpc_stat_resp_tx_, 0);
 
-	credit_carry = 0.0;
-
 	laddr.ip = 0;
 	laddr.port = SRPC_PORT;
 
 	ret = tcp_listen(laddr, 4096, &q);
 	BUG_ON(ret);
+
+	waitgroup_done(wg_listener);
 
 	while (true) {
 		ret = tcp_accept(q, &c);
@@ -1096,6 +1128,7 @@ int sbw_enable(srpc_fn_t handler)
 {
 	static DEFINE_SPINLOCK(l);
 	int ret;
+	waitgroup_t wg_listener;
 
 	spin_lock_np(&l);
 	if (srpc_handler) {
@@ -1105,9 +1138,19 @@ int sbw_enable(srpc_fn_t handler)
 	srpc_handler = handler;
 	spin_unlock_np(&l);
 
-	ret = thread_spawn(srpc_listener, NULL);
+	waitgroup_init(&wg_listener);
+	waitgroup_add(&wg_listener, 1);
+	ret = thread_spawn(srpc_listener, &wg_listener);
 	BUG_ON(ret);
+
+	waitgroup_wait(&wg_listener);
+
 	return 0;
+}
+
+void sbw_drop() {
+        struct srpc_ctx *ctx = (struct srpc_ctx *)get_rpc_ctx();
+	ctx->drop = true;
 }
 
 uint64_t sbw_stat_cupdate_rx()
@@ -1142,6 +1185,7 @@ uint64_t sbw_stat_resp_tx()
 
 struct srpc_ops sbw_ops = {
 	.srpc_enable		= sbw_enable,
+	.srpc_drop		= sbw_drop,
 	.srpc_stat_cupdate_rx	= sbw_stat_cupdate_rx,
 	.srpc_stat_ecredit_tx	= sbw_stat_ecredit_tx,
 	.srpc_stat_credit_tx	= sbw_stat_credit_tx,

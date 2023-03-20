@@ -298,7 +298,8 @@ again:
 }
 
 int cdg_open(struct netaddr raddr, struct crpc_session **sout, int id,
-	     crpc_ldrop_fn_t ldrop_handler, crpc_rdrop_fn_t rdrop_handler)
+	     crpc_ldrop_fn_t ldrop_handler, crpc_rdrop_fn_t rdrop_handler,
+	     struct rpc_session_info *info)
 {
 	struct netaddr laddr;
 	struct cdg_session *s;
@@ -318,6 +319,11 @@ int cdg_open(struct netaddr raddr, struct crpc_session **sout, int id,
 	/* dial */
 	ret = tcp_dial(laddr, raddr, &c);
 	if (ret)
+		return ret;
+
+	/* send session info */
+	ret = tcp_write_full(c, info, sizeof(*info));
+	if (unlikely(ret < 0))
 		return ret;
 
 	/* alloc session */
@@ -357,6 +363,7 @@ int cdg_open(struct netaddr raddr, struct crpc_session **sout, int id,
 	/* init session */
 	s->cmn.nconns = 1;
 	s->cmn.c[0] = (struct crpc_conn *)cc;
+	s->cmn.session_type = info->session_type;
 	s->id = id;
 	s->req_id = 1;
 	mutex_init(&s->lock);
