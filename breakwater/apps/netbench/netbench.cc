@@ -492,151 +492,18 @@ void RpcServer(struct srpc_ctx *ctx) {
 
   int midx;
 
-  if (hash % 1000 < 500) midx = 0;
+  if (hash % 1000 < 200) midx = 0;
   else midx = 1;
 
   if (workn != 0) {
-    mutex_lock(&shared_mutex[midx]);
-    workers[get_current_affinity()]->Work(workn);
-    mutex_unlock(&shared_mutex[midx]);
-    /*
-    if (mutex_try_lock(&shared_mutex[midx])) {
+    if (mutex_lock_if_uncongested(&shared_mutex[midx])) {
       workers[get_current_affinity()]->Work(workn);
       mutex_unlock(&shared_mutex[midx]);
     } else {
       ctx->drop = true;
       return;
-    }*/
-    /*if (mutex_lock_if_uncongested(&shared_mutex[midx])) {
-      workers[get_current_affinity()]->Work(workn);
-      mutex_unlock(&shared_mutex[midx]);
-    } else {
-      ctx->drop = true;
-      return;
-    }*/
-  }
-
-  //if (workn != 0) w->Work(workn);
-  /*
-  if (workn != 0) {
-    if (hash % 1000 < 200) {
-      if (mutex_try_lock(&shared_mutex[0])) {
-	workers[get_current_affinity()]->Work(workn);
-	mutex_unlock(&shared_mutex[0]);
-      } else {
-        ctx->drop = true;
-	return;
-      }
-  */
-
-      /*
-      mutex_lock(&shared_mutex[midx]);
-      workers[get_current_affinity()]->Work(workn);
-      mutex_unlock(&shared_mutex[midx]);
-      */
-
-      //mutex_lock(&shared_mutex[midx]);
-      /*if (!mutex_lock_if_uncongested(&shared_mutex[midx])) {
-        ctx->drop = true;
-	return;
-      }*/
-      //spin_lock_np(&shared_spin[midx]);
-      //w->Work(workn);
-      //spin_unlock_np(&shared_spin[midx]);
-      //mutex_unlock(&shared_mutex[midx]);
-/*
-    } else {
-      if (mutex_try_lock(&shared_mutex[1])) {
-	workers[get_current_affinity()]->Work(workn);
-	mutex_unlock(&shared_mutex[1]);
-      } else {
-        ctx->drop = true;
-	return;
-      }
     }
   }
-*/
-/*
-  if (workn != 0) {
-    if (hash % 100 <= 20) {
-      shared_mutex.Lock();
-      if (get_latency_budget() == 0) {
-        ctx->drop = true;
-	return;
-      }
-      w->Work(workn);
-      shared_mutex.Unlock();
-    } else {
-      w->Work(workn);
-    }
-  }
-*/
-/*
-  if (workn != 0) {
-    switch (stype) {
-      case 0:
-        w->Work(workn);
-	break;
-      case 1:
-	shared_mutex.Lock();
-	w->Work(workn);
-	shared_mutex.Unlock();
-      default:
-	break;
-    }
-  }
-*/
-//    shared_mutex.Lock();
-//    w->Work(workn);
-//    shared_mutex.Unlock();
-/*
-  if (workn != 0) {
-	  shared_mutex.Lock();
-	  while (running > 2)
-		  shared_cv.Wait(&shared_mutex);
-	  running++;
-	  shared_mutex.Unlock();
-
-	  w->Work(workn);
-
-	  shared_mutex.Lock();
-	  running--;
-	  shared_cv.Signal();
-	  shared_mutex.Unlock();
-  }
-*/
-  /*
-  const int npara = 16;
-  std::vector<rt::Thread> ths;
-  if (workn != 0) {
-    for (int i = 0; i < npara; ++i) {
-      ths.emplace_back(rt::Thread([&, i] {
-        w->Work(workn / npara);
-      }));
-    }
-
-    for (auto &th : ths)
-      th.Join();
-  }*/
-
-  /*
-  const int npara = 8;
-  std::vector<rt::Thread> ths;
-  for (int i = 0; i < npara; ++i) {
-    ths.emplace_back(rt::Thread([&, i] {
-      shared_mutex[(hash + i) % 10].Lock();
-      w->Work(workn/npara);
-      shared_mutex[(hash + i) % 10].Unlock();
-    }));
-  }
-
-  uint64_t start = rdtsc();
-  for (auto &th : ths)
-    th.Join();
-  uint64_t end = rdtsc();
-
-  add_thread_mutex_delay(end - start);
-  */
 
   // Craft a response.
   ctx->resp_len = sizeof(payload);
