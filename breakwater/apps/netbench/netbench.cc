@@ -1477,7 +1477,7 @@ int main(int argc, char *argv[]) {
   if (olc.compare("breakwater") == 0) {
     crpc_ops = &cbw_ops;
     srpc_ops = &sbw_ops;
-  } else if (olc.compare("breakwater2") == 0) {
+  } else if (olc.compare("protego") == 0) {
     crpc_ops = &cbw_ops;
     srpc_ops = &sbw2_ops;
   } else if (olc.compare("seda") == 0) {

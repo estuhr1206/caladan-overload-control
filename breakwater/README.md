@@ -1,18 +1,18 @@
-# Breakwater
-Breakwater is a server overload control system for
-microseconds-level RPCs. This repo includes 
-Shenango implementation of Breakwater as a library of
+# Protego
+Protego is a server overload control system for
+applications with unpredictable lock contention. This repo includes 
+Shenango implementation of Protego as a library of
 RPC layer between network transport and application.
-Breakwater shares the Shenango code-base with
+Protego shares the Shenango code-base with
 [Caladan](https://github.com/joshuafried/caladan-ae),
-but Breakwater is independent to Caladan.
+but Protego is independent to Caladan.
 
 ## Supported platform
-Breakwater requires an Intel server with many cores equipped
+Protego requires an Intel server with many cores equipped
 with an Intel NIC based on 82599 chip or Mellanox ConnectX-4
 or ConnectX-5 NIC. For the best performance,
 server and client machines with Mellanox NICs connected with
-a low latency switch are necessary. Breakwater has been tested
+a low latency switch are necessary. Protego has been tested
 on Ubuntu 18.04 with Linux kernel 4.15.0.
 
 ## Terminology
@@ -26,7 +26,7 @@ and others are agents.)
 and collects data from them. Observer could be the same as server,
 client, or agent machines.
 
-## Running Breakwater
+## Running Protego
 0. Install dependencies
 ```
 $ sudo apt-get update
@@ -66,20 +66,20 @@ breakwater$ make -C apps/netbench/
 breakwater$ sudo ./iokerneld
 ```
 
-7. Start application. The following example will start a server with Breakwater and make a client to generate workload with exponential distribution (10us average and 100us of SLO) at a rate of 100k requests/s by 100 threads.
+7. Start application. The following example will start a server with Protego and make a client to generate workload with exponential distribution (10us average and 100us of SLO) at a rate of 100k requests/s by 100 threads.
 
 On the server:
 ```
-breakwater$ sudo ./apps/netbench/netbench breakwater ../server.config server
+breakwater$ sudo ./apps/netbench/netbench protego ../server.config server
 ```
 
 On the client:
 ```
-breakwater$ sudo ./apps/netbench/netbench breakwater ../client.config client 100 192.168.1.3 10 exp 100 0 100000
+breakwater$ sudo ./apps/netbench/netbench protego ../client.config client 100 192.168.1.3 10 exp 100 0 100000
 ```
 
 ## Reproducing paper results
-Please refer to [breakwater-artifact](https://github.com/inhocho89/breakwater-artifact) repository for experiment scripts to reproduce the paper results.
+Please refer to [protego-artifact](https://github.com/inhocho89/protego-artifact) repository for experiment scripts to reproduce the paper results.
 
 ## Contact
 If you have any questions, feel free to contact Inho Cho <inhocho@csail.mit.edu>.
