@@ -271,7 +271,7 @@ static uint64_t sched_measure_mlx5_delay(struct hwq *h)
 }
 
 static bool
-sched_measure_hardware_delay(struct thread *th, struct hwq *h,
+sched_measure_hardware_delay(struct proc *p, struct thread *th, struct hwq *h,
 			     bool update_pointers)
 {
 	uint32_t cur_tail, cur_head, last_head, last_tail;
@@ -301,8 +301,8 @@ sched_measure_hardware_delay(struct thread *th, struct hwq *h,
 	if (cur_tail != last_tail || h->busy_since == UINT64_MAX)
 		h->busy_since = cur_tsc;
 
-	return th->active ? wraps_lt(cur_tail, last_head) :
-				 cur_head != cur_tail;
+	return (th->active || (h->queue_steering && p->active_thread_count)) ?
+		wraps_lt(cur_tail, last_head) : cur_head != cur_tail;
 }
 
 static uint64_t calc_delay_tsc(uint64_t tsc)
@@ -311,7 +311,7 @@ static uint64_t calc_delay_tsc(uint64_t tsc)
 }
 
 static bool
-sched_measure_kthread_delay(struct thread *th,
+sched_measure_kthread_delay(struct proc *p, struct thread *th,
 			    uint64_t *rxq_tsc, uint64_t *uthread_tsc,
 			    uint64_t *storage_tsc, uint64_t *timer_tsc)
 {
@@ -372,7 +372,7 @@ sched_measure_kthread_delay(struct thread *th,
 	*timer_tsc = calc_delay_tsc(tmp);
 
 	/* DIRECTPATH: measure delay and update signals */
-	if (sched_measure_hardware_delay(th, &th->directpath_hwq, true))
+	if (sched_measure_hardware_delay(p, th, &th->directpath_hwq, true))
 		busy = true;
 
 	// TODO: use sched_measure_mlx5_delay() instead of scanning the descriptor
@@ -384,7 +384,7 @@ sched_measure_kthread_delay(struct thread *th,
 		*rxq_tsc = MAX(*rxq_tsc, calc_delay_tsc(th->directpath_hwq.busy_since));
 
 	/* STORAGE: measure delay and update signals */
-	if (sched_measure_hardware_delay(th, &th->storage_hwq, true))
+	if (sched_measure_hardware_delay(p, th, &th->storage_hwq, true))
 		busy = true;
 	*storage_tsc = calc_delay_tsc(th->storage_hwq.busy_since);
 
@@ -415,7 +415,7 @@ static void sched_measure_delay(struct proc *p)
 	for (i = 0; i < p->thread_count; i++) {
 		uint64_t delay, rxq_tsc, uthread_tsc, storage_tsc, timer_tsc;
 
-		busy |= sched_measure_kthread_delay(&p->threads[i],
+		busy |= sched_measure_kthread_delay(p, &p->threads[i],
 			&rxq_tsc, &uthread_tsc, &storage_tsc, &timer_tsc);
 		delay = rxq_tsc + uthread_tsc + storage_tsc + timer_tsc;
 		hdelay = MAX(delay, hdelay);
@@ -451,7 +451,7 @@ static void sched_detect_io_for_idle_runtime(struct proc *p)
 	for (i = 0; i < p->thread_count; i++) {
 		th = &p->threads[i];
 
-		if (sched_measure_hardware_delay(th, &th->directpath_hwq, false)) {
+		if (sched_measure_hardware_delay(p, th, &th->directpath_hwq, false)) {
 			sched_add_core(p);
 			return;
 		}
