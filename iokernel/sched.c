@@ -455,7 +455,7 @@ static void sched_measure_delay(struct proc *p)
 			cur_tsc = rdtsc();
 		}
 
-		busy |= sched_measure_kthread_delay(&p->threads[i],
+		busy |= sched_measure_kthread_delay(p, &p->threads[i],
 						&rxq_tsc, &uthread_tsc, &storage_tsc,
 						&timer_tsc, &parked_delay,
 						&program_cycles, &sched_cycles);
