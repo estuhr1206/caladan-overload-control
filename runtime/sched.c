@@ -17,6 +17,9 @@
 
 #include "defs.h"
 
+// TODO this seems unsafe
+#include <bw_server.h>
+
 /* the current running thread, or NULL if there isn't one */
 __thread thread_t *__self;
 /* a pointer to the top of the per-kthread (TLS) runtime stack */
@@ -42,6 +45,7 @@ static __thread uint64_t last_watchdog_tsc;
 
 /* whether yield requests are enabled or not */
 bool cfg_yield_requests_enabled;
+bool cfg_breakwater_prevent_parks;
 
 /**
  * In inc/runtime/thread.h, this function is declared inline (rather than static
@@ -349,6 +353,13 @@ static __noreturn __noinline void schedule(void)
 	int i, sibling;
 	bool return_to_after_yield = false;
 
+	// caladan-overload-control changes
+	// in bw_server.c, the values are atomic_t, aka volatile int
+	int old_C_issued;
+	int current_C_issued;
+	int breakwater_park_target;
+	bool notified_breakwater = false;
+
 	assert_spin_lock_held(&l->lock);
 	assert(l->parked == false);
 
@@ -463,6 +474,24 @@ again:
 		}
 	}
 park:
+	// caladan-overload-control
+	// read current outstanding credits
+	if (cfg_breakwater_prevent_parks) {
+		current_C_issued = get_breakwater_srpc_credit_used();
+		if (notified_breakwater && old_C_issued - current_C_issued >= breakwater_park_target) {
+			// allow park
+			notified_breakwater = false;
+			// log_info()
+		}
+		else {
+			if (!notified_breakwater) {
+				notify_breakwater_parking(&old_C_issued, &breakwater_park_target); // breakwater can know current cores, runtime_active_cores but what if competing applications?
+				notified_breakwater = true;
+			}
+			goto again;
+		}
+	}
+	
 
 	l->parked = true;
 	spin_unlock(&l->lock);
@@ -486,6 +515,14 @@ park:
 	goto again;
 
 done:
+
+	// caladan-overload-control
+	if (notified_breakwater) {
+		// we found work, restore credits to breakwater
+		notify_breakwater_found_work(breakwater_park_target);
+		notified_breakwater = false;
+	}
+
 	/* pop off a thread and run it */
 	assert(l->rq_head != l->rq_tail);
 	th = l->rq[l->rq_tail++ % RUNTIME_RQ_SIZE];

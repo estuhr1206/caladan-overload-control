@@ -435,6 +435,12 @@ static int parse_enable_gc(const char *name, const char *val)
 #endif
 }
 
+static int parse_breakwater_prevent_parks_flag(const char *name, const char *val)
+{
+	cfg_breakwater_prevent_parks = true;
+	return 0;
+}
+
 
 /*
  * Parsing Infrastructure
@@ -474,6 +480,7 @@ static const struct cfg_handler cfg_handlers[] = {
 	{ "enable_storage", parse_enable_storage, false },
 	{ "enable_directpath", parse_enable_directpath, false },
 	{ "enable_gc", parse_enable_gc, false },
+	{ "breakwater_prevent_parks", parse_breakwater_prevent_parks_flag, false },
 
 };
 

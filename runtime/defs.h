@@ -316,6 +316,7 @@ extern bool cfg_gc_enabled;
 #endif
 
 extern bool cfg_yield_requests_enabled;
+extern bool cfg_breakwater_prevent_parks;
 
 /*
  * Per-kernel-thread State

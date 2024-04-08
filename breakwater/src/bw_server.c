@@ -23,6 +23,8 @@
 #include "bw_config.h"
 #include "bw2_config.h"
 
+#include <bw_server.h>
+
 /* time-series output */
 #define SBW_TS_OUT		false
 #define TS_BUF_SIZE_EXP		10
@@ -1181,6 +1183,27 @@ uint64_t sbw_stat_req_dropped()
 uint64_t sbw_stat_resp_tx()
 {
 	return atomic64_read(&srpc_stat_resp_tx_);
+}
+
+// caladan-overload-control
+
+int get_breakwater_srpc_credit_used() {
+	return atomic_read(&srpc_credit_used);
+}
+
+void notify_breakwater_parking(int* old_C_issued, int* breakwater_park_target) {
+	int curr_cores = runtime_active_cores();
+	int credit_pool = atomic_read(&srpc_credit_pool);
+	// this minimum for credits (max cores) is used throughout breakwater implementation
+	int new_credit_pool = (int) (SBW_CORE_PARK_TARGET * (credit_pool - (credit_pool / curr_cores)));
+	new_credit_pool = MAX(runtime_max_cores(), new_credit_pool);
+	*old_C_issued = atomic_read(&srpc_credit_used);
+	atomic_write(&srpc_credit_pool, new_credit_pool);
+	*breakwater_park_target = credit_pool - new_credit_pool;
+}
+
+void notify_breakwater_found_work(int restore) {
+	atomic_fetch_and_add(&srpc_credit_pool, restore);
 }
 
 struct srpc_ops sbw_ops = {
