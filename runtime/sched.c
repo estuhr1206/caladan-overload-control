@@ -18,7 +18,12 @@
 #include "defs.h"
 
 // TODO this seems unsafe
-#include <bw_server.h>
+// #include <bw_server.h>
+/* global credit pool */
+atomic_t srpc_credit_pool;
+
+/* global credit used */
+atomic_t srpc_credit_used;
 
 /* the current running thread, or NULL if there isn't one */
 __thread thread_t *__self;
@@ -46,6 +51,7 @@ static __thread uint64_t last_watchdog_tsc;
 /* whether yield requests are enabled or not */
 bool cfg_yield_requests_enabled;
 bool cfg_breakwater_prevent_parks;
+float cfg_SBW_CORE_PARK_TARGET;
 
 /**
  * In inc/runtime/thread.h, this function is declared inline (rather than static
@@ -477,7 +483,7 @@ park:
 	// caladan-overload-control
 	// read current outstanding credits
 	if (cfg_breakwater_prevent_parks) {
-		current_C_issued = get_breakwater_srpc_credit_used();
+		current_C_issued = atomic_read(&srpc_credit_used);
 		if (notified_breakwater && old_C_issued - current_C_issued >= breakwater_park_target) {
 			// allow park
 			notified_breakwater = false;
@@ -485,7 +491,13 @@ park:
 		}
 		else {
 			if (!notified_breakwater) {
-				notify_breakwater_parking(&old_C_issued, &breakwater_park_target); // breakwater can know current cores, runtime_active_cores but what if competing applications?
+				int credit_pool = atomic_read(&srpc_credit_pool);
+				// this minimum for credits (max cores) is used throughout breakwater implementation
+				int new_credit_pool = (int) (cfg_SBW_CORE_PARK_TARGET * (credit_pool - (credit_pool / runtime_active_cores())));
+				new_credit_pool = MAX(runtime_max_cores(), new_credit_pool);
+				old_C_issued = atomic_read(&srpc_credit_used);
+				atomic_write(&srpc_credit_pool, new_credit_pool);
+				breakwater_park_target = credit_pool - new_credit_pool;
 				notified_breakwater = true;
 			}
 			goto again;
@@ -517,9 +529,9 @@ park:
 done:
 
 	// caladan-overload-control
-	if (notified_breakwater) {
+	if (cfg_breakwater_prevent_parks && notified_breakwater) {
 		// we found work, restore credits to breakwater
-		notify_breakwater_found_work(breakwater_park_target);
+		atomic_fetch_and_add(&srpc_credit_pool, breakwater_park_target);
 		notified_breakwater = false;
 	}
 

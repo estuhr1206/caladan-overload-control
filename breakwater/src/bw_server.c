@@ -23,7 +23,9 @@
 #include "bw_config.h"
 #include "bw2_config.h"
 
-#include <bw_server.h>
+// #include <bw_server.h>
+extern atomic_t srpc_credit_pool;
+extern atomic_t srpc_credit_used;
 
 /* time-series output */
 #define SBW_TS_OUT		false
@@ -71,13 +73,15 @@ atomic_t srpc_num_drained;
 atomic_t srpc_num_active;
 
 /* global credit pool */
-atomic_t srpc_credit_pool;
+// moving definition to runtime/sched.c for breakwater parking
+// atomic_t srpc_credit_pool;
 
 /* timestamp of the latest credit pool update */
 uint64_t srpc_last_cp_update;
 
 /* global credit used */
-atomic_t srpc_credit_used;
+// moving definition to runtime/sched.c for breakwater parking
+// atomic_t srpc_credit_used;
 
 /* downstream credit for multi-hierarchy */
 atomic_t srpc_credit_ds;
@@ -1187,24 +1191,24 @@ uint64_t sbw_stat_resp_tx()
 
 // caladan-overload-control
 
-int get_breakwater_srpc_credit_used() {
-	return atomic_read(&srpc_credit_used);
-}
+// int get_breakwater_srpc_credit_used() {
+// 	return atomic_read(&srpc_credit_used);
+// }
 
-void notify_breakwater_parking(int* old_C_issued, int* breakwater_park_target) {
-	int curr_cores = runtime_active_cores();
-	int credit_pool = atomic_read(&srpc_credit_pool);
-	// this minimum for credits (max cores) is used throughout breakwater implementation
-	int new_credit_pool = (int) (SBW_CORE_PARK_TARGET * (credit_pool - (credit_pool / curr_cores)));
-	new_credit_pool = MAX(runtime_max_cores(), new_credit_pool);
-	*old_C_issued = atomic_read(&srpc_credit_used);
-	atomic_write(&srpc_credit_pool, new_credit_pool);
-	*breakwater_park_target = credit_pool - new_credit_pool;
-}
+// void notify_breakwater_parking(int* old_C_issued, int* breakwater_park_target) {
+// 	int curr_cores = runtime_active_cores();
+// 	int credit_pool = atomic_read(&srpc_credit_pool);
+// 	// this minimum for credits (max cores) is used throughout breakwater implementation
+// 	int new_credit_pool = (int) (SBW_CORE_PARK_TARGET * (credit_pool - (credit_pool / curr_cores)));
+// 	new_credit_pool = MAX(runtime_max_cores(), new_credit_pool);
+// 	*old_C_issued = atomic_read(&srpc_credit_used);
+// 	atomic_write(&srpc_credit_pool, new_credit_pool);
+// 	*breakwater_park_target = credit_pool - new_credit_pool;
+// }
 
-void notify_breakwater_found_work(int restore) {
-	atomic_fetch_and_add(&srpc_credit_pool, restore);
-}
+// void notify_breakwater_found_work(int restore) {
+// 	atomic_fetch_and_add(&srpc_credit_pool, restore);
+// }
 
 struct srpc_ops sbw_ops = {
 	.srpc_enable		= sbw_enable,

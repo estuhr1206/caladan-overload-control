@@ -437,6 +437,20 @@ static int parse_enable_gc(const char *name, const char *val)
 
 static int parse_breakwater_prevent_parks_flag(const char *name, const char *val)
 {
+	float tmp;
+	int ret;
+
+	ret = str_to_float(val, &tmp);
+	if (ret)
+		return ret;
+
+	// if (tmp < 0 || tmp > 1.0) {
+	// 	log_err("runtime_util_upper_thresh must be between 0 and 1.0");
+	// 	return -EINVAL;
+	// }
+
+	cfg_SBW_CORE_PARK_TARGET = tmp;
+
 	cfg_breakwater_prevent_parks = true;
 	return 0;
 }
