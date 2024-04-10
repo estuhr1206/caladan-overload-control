@@ -484,7 +484,7 @@ park:
 	// read current outstanding credits
 	if (cfg_breakwater_prevent_parks) {
 		current_C_issued = atomic_read(&srpc_credit_used);
-		if (notified_breakwater && old_C_issued - current_C_issued >= breakwater_park_target) {
+		if (notified_breakwater && old_C_issued - current_C_issued >= cfg_SBW_CORE_PARK_TARGET * breakwater_park_target) {
 			// allow park
 			notified_breakwater = false;
 			// log_info()
@@ -493,7 +493,7 @@ park:
 			if (!notified_breakwater) {
 				int credit_pool = atomic_read(&srpc_credit_pool);
 				// this minimum for credits (max cores) is used throughout breakwater implementation
-				int new_credit_pool = (int) (cfg_SBW_CORE_PARK_TARGET * (credit_pool - (credit_pool / runtime_active_cores())));
+				int new_credit_pool = (int) (credit_pool - (credit_pool / runtime_active_cores()));
 				new_credit_pool = MAX(runtime_max_cores(), new_credit_pool);
 				old_C_issued = atomic_read(&srpc_credit_used);
 				atomic_write(&srpc_credit_pool, new_credit_pool);
@@ -531,6 +531,8 @@ done:
 	// caladan-overload-control
 	if (cfg_breakwater_prevent_parks && notified_breakwater) {
 		// we found work, restore credits to breakwater
+		// breakwater technically has a max pool size: credit_pool = MIN(credit_pool, num_sess << SBW_MAX_WINDOW_EXP aka 6);
+		// this is unlikely to be hit though. And will be fixed by breakwater quickly if needed.
 		atomic_fetch_and_add(&srpc_credit_pool, breakwater_park_target);
 		notified_breakwater = false;
 	}
