@@ -180,14 +180,14 @@ static void record(int credit_pool, uint64_t delay)
 
 	event->timestamp = microtime();
 	event->credit_pool = credit_pool;
-	event->credit_used = atomic_read(&srpc_credit_used[0]);
-	event->num_pending = atomic_read(&srpc_num_pending[0]);
-	event->num_drained = atomic_read(&srpc_num_drained[0]);
-	event->num_active = atomic_read(&srpc_num_active[0]);
-	event->num_sess = atomic_read(&srpc_num_sess[0]);
+	event->credit_used = atomic_read(&srpc_credit_used);
+	event->num_pending = atomic_read(&srpc_num_pending);
+	event->num_drained = atomic_read(&srpc_num_drained);
+	event->num_active = atomic_read(&srpc_num_active);
+	event->num_sess = atomic_read(&srpc_num_sess);
 	event->delay = delay;
 	event->num_cores = runtime_active_cores();
-	event->avg_st = atomic_read(&srpc_avg_st[0]);
+	event->avg_st = atomic_read(&srpc_avg_st);
 
 	if (nextIndex == 0)
 		printRecord();
