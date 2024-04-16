@@ -318,6 +318,7 @@ extern bool cfg_gc_enabled;
 extern bool cfg_yield_requests_enabled;
 extern bool cfg_breakwater_prevent_parks;
 extern float cfg_SBW_CORE_PARK_TARGET;
+extern uint64_t cfg_SBW_DROP_THRESHOLD;
 
 /*
  * Per-kernel-thread State

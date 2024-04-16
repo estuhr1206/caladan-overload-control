@@ -50,8 +50,10 @@ static __thread uint64_t last_watchdog_tsc;
 
 /* whether yield requests are enabled or not */
 bool cfg_yield_requests_enabled;
-bool cfg_breakwater_prevent_parks;
-float cfg_SBW_CORE_PARK_TARGET;
+bool cfg_breakwater_prevent_parks = false;
+float cfg_SBW_CORE_PARK_TARGET = 1.0;
+// uint64_t to match the return type of runtime_queue_us()
+uint64_t cfg_SBW_DROP_THRESHOLD = 0;
 
 /**
  * In inc/runtime/thread.h, this function is declared inline (rather than static
@@ -483,6 +485,15 @@ park:
 	// caladan-overload-control
 	// read current outstanding credits
 	if (cfg_breakwater_prevent_parks) {
+		if (atomic_read(&runningks) == maxks && runtime_queue_us() >= cfg_SBW_DROP_THRESHOLD) {
+			// overloaded and at max cores: we should not be parking or reducing credits
+			if (notified_breakwater) { // could add unlikely tag to this. But not if loadshift? Unless we don't even need to be really replacing here
+				atomic_fetch_and_add(&srpc_credit_pool, breakwater_park_target);
+				notified_breakwater = false;
+			}
+			goto again;
+		}
+
 		current_C_issued = atomic_read(&srpc_credit_used);
 		if (notified_breakwater && old_C_issued - current_C_issued >= cfg_SBW_CORE_PARK_TARGET * breakwater_park_target) {
 			// allow park
@@ -500,6 +511,7 @@ park:
 				breakwater_park_target = credit_pool - new_credit_pool;
 				notified_breakwater = true;
 			}
+			// iters++; // shouldn't happen unless a yield request sent us here
 			goto again;
 		}
 	}

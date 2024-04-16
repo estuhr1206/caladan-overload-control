@@ -455,6 +455,24 @@ static int parse_breakwater_prevent_parks_flag(const char *name, const char *val
 	return 0;
 }
 
+static int parse_breakwater_drop_threshold(const char *name, const char *val)
+{
+	long tmp;
+	int ret;
+
+	ret = str_to_long(val, &tmp);
+	if (ret)
+		return ret;
+
+	// if (tmp < 0 || tmp > 1.0) {
+	// 	log_err("runtime_util_upper_thresh must be between 0 and 1.0");
+	// 	return -EINVAL;
+	// }
+
+	cfg_SBW_DROP_THRESHOLD = tmp;
+	return 0;
+}
+
 
 /*
  * Parsing Infrastructure
@@ -495,7 +513,7 @@ static const struct cfg_handler cfg_handlers[] = {
 	{ "enable_directpath", parse_enable_directpath, false },
 	{ "enable_gc", parse_enable_gc, false },
 	{ "breakwater_prevent_parks", parse_breakwater_prevent_parks_flag, false },
-
+	{ "breakwater_drop_threshold", parse_breakwater_drop_threshold, false },
 };
 
 /**
@@ -581,6 +599,13 @@ int cfg_load(const char *path)
 		log_err("invalid number of guaranteed kthreads requested, '%d'",
 				guaranteedks);
 		log_err("must be <= %d (number of kthreads)", maxks);
+		ret = -EINVAL;
+		goto out;
+	}
+
+	if (cfg_breakwater_prevent_parks && cfg_SBW_DROP_THRESHOLD == 0) {
+		log_err("breakwater parking enabled without setting breakwater drop threhsold");
+		log_err("please use: SBW_DROP_THRESHOLD <value> in your config");
 		ret = -EINVAL;
 		goto out;
 	}
