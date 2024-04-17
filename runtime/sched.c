@@ -25,9 +25,6 @@ atomic_t srpc_credit_pool;
 /* global credit used */
 atomic_t srpc_credit_used;
 
-/* drop tracker from bw_server.c */
-atomic64_t srpc_stat_req_dropped_;
-
 /* the current running thread, or NULL if there isn't one */
 __thread thread_t *__self;
 /* a pointer to the top of the per-kthread (TLS) runtime stack */
@@ -56,7 +53,7 @@ bool cfg_yield_requests_enabled;
 bool cfg_breakwater_prevent_parks = false;
 float cfg_SBW_CORE_PARK_TARGET = 1.0;
 // uint64_t to match the return type of runtime_queue_us()
-uint64_t cfg_SBW_DROP_THRESHOLD = 0;
+long cfg_CORE_CREDIT_RATIO = 0;
 
 /**
  * In inc/runtime/thread.h, this function is declared inline (rather than static
@@ -370,9 +367,6 @@ static __noreturn __noinline void schedule(void)
 	int current_C_issued;
 	int breakwater_park_target;
 	bool notified_breakwater = false;
-	// atomic64_t is a volatile long
-	// unsure if this is a good spot to initialize this
-	long old_drops = atomic64_read(&srpc_stat_req_dropped_);
 
 	assert_spin_lock_held(&l->lock);
 	assert(l->parked == false);
@@ -491,18 +485,11 @@ park:
 	// caladan-overload-control
 	// read current outstanding credits
 	if (cfg_breakwater_prevent_parks) {
-		long current_drops = atomic64_read(&srpc_stat_req_dropped_);
-		if (atomic_read(&runningks) == maxks && current_drops > old_drops) {
-			old_drops = current_drops;
+		current_C_issued = atomic_read(&srpc_credit_used);
+		if (!notified_breakwater && atomic_read(&runningks) == maxks && current_C_issued < (cfg_CORE_CREDIT_RATIO * maxks)) {
 			// overloaded and at max cores: we should not be parking or reducing credits
-			if (notified_breakwater) { // could add unlikely tag to this. But not if loadshift? Unless we don't even need to be really replacing here
-				atomic_fetch_and_add(&srpc_credit_pool, breakwater_park_target);
-				notified_breakwater = false;
-			}
 			goto again;
 		}
-		old_drops = current_drops;
-		current_C_issued = atomic_read(&srpc_credit_used);
 		if (notified_breakwater && old_C_issued - current_C_issued >= cfg_SBW_CORE_PARK_TARGET * breakwater_park_target) {
 			// allow park
 			notified_breakwater = false;

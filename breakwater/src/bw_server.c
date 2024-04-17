@@ -26,7 +26,6 @@
 // #include <bw_server.h>
 extern atomic_t srpc_credit_pool;
 extern atomic_t srpc_credit_used;
-extern atomic64_t srpc_stat_req_dropped_;
 
 /* time-series output */
 #define SBW_TS_OUT		false
@@ -151,7 +150,7 @@ atomic64_t srpc_stat_cupdate_rx_;
 atomic64_t srpc_stat_ecredit_tx_;
 atomic64_t srpc_stat_credit_tx_;
 atomic64_t srpc_stat_req_rx_;
-// atomic64_t srpc_stat_req_dropped_;
+atomic64_t srpc_stat_req_dropped_;
 atomic64_t srpc_stat_resp_tx_;
 
 #if SBW_TS_OUT

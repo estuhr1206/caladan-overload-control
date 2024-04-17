@@ -455,7 +455,7 @@ static int parse_breakwater_prevent_parks_flag(const char *name, const char *val
 	return 0;
 }
 
-static int parse_breakwater_drop_threshold(const char *name, const char *val)
+static int parse_breakwater_core_credit_ratio(const char *name, const char *val)
 {
 	long tmp;
 	int ret;
@@ -469,7 +469,7 @@ static int parse_breakwater_drop_threshold(const char *name, const char *val)
 	// 	return -EINVAL;
 	// }
 
-	cfg_SBW_DROP_THRESHOLD = tmp;
+	cfg_CORE_CREDIT_RATIO = tmp;
 	return 0;
 }
 
@@ -513,7 +513,7 @@ static const struct cfg_handler cfg_handlers[] = {
 	{ "enable_directpath", parse_enable_directpath, false },
 	{ "enable_gc", parse_enable_gc, false },
 	{ "breakwater_prevent_parks", parse_breakwater_prevent_parks_flag, false },
-	{ "breakwater_drop_threshold", parse_breakwater_drop_threshold, false },
+	{ "breakwater_core_credit_ratio", parse_breakwater_core_credit_ratio, false },
 };
 
 /**
@@ -603,9 +603,9 @@ int cfg_load(const char *path)
 		goto out;
 	}
 
-	if (cfg_breakwater_prevent_parks && cfg_SBW_DROP_THRESHOLD == 0) {
-		log_err("breakwater parking enabled without setting breakwater drop threhsold");
-		log_err("please use: SBW_DROP_THRESHOLD <value> in your config");
+	if (cfg_breakwater_prevent_parks && cfg_CORE_CREDIT_RATIO == 0) {
+		log_err("breakwater parking enabled without setting breakwater core credit ratio");
+		log_err("please use: breakwater_core_credit_ratio <value> in your config");
 		ret = -EINVAL;
 		goto out;
 	}
