@@ -490,7 +490,7 @@ park:
 			// overloaded and at max cores: we should not be parking or reducing credits
 			goto again;
 		}
-		if (notified_breakwater && old_C_issued - current_C_issued >= cfg_SBW_CORE_PARK_TARGET * breakwater_park_target) {
+		if (notified_breakwater && old_C_issued - current_C_issued >= breakwater_park_target) {
 			// allow park
 			notified_breakwater = false;
 			// log_info()
@@ -499,7 +499,7 @@ park:
 			if (!notified_breakwater) {
 				int credit_pool = atomic_read(&srpc_credit_pool);
 				// this minimum for credits (max cores) is used throughout breakwater implementation
-				int new_credit_pool = (int) (credit_pool - (credit_pool / runtime_active_cores()));
+				int new_credit_pool = (int) (credit_pool - (cfg_SBW_CORE_PARK_TARGET * (credit_pool / runtime_active_cores())));
 				new_credit_pool = MAX(runtime_max_cores(), new_credit_pool);
 				old_C_issued = atomic_read(&srpc_credit_used);
 				atomic_write(&srpc_credit_pool, new_credit_pool);
