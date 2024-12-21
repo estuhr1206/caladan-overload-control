@@ -48,7 +48,7 @@ int64_t ShmMonitor::Poll(int64_t now) {
 
   uint64_t total = 0;
   for (uint64_t i = 0; i < nlines; i++) total += mem[i * LINESTRIDE];
-  printf("%x %lu %lu\n", key, total - last_total, rdtsc());
+  log_info("%x %lu %lu", key, total - last_total, rdtsc()); // was printf()
   last_total = total;
   next_us = now + frequency_us;
   return next_us;

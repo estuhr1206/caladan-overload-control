@@ -1,0 +1,7 @@
+{
+    "files.associations": {
+        "preempt.h": "c",
+        "sched.h": "c",
+        "tcache.h": "c"
+    }
+}

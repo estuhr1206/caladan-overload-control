@@ -33,3 +33,7 @@
 #define SBW_MAX_WINDOW			64
 
 #define CBW_MAX_CLIENT_DELAY_US		10
+
+/* scales the targeted reduction in credits before allowing a core to park */
+// moving to be initialzed by server.config instead
+// #define SBW_CORE_PARK_TARGET 1.0

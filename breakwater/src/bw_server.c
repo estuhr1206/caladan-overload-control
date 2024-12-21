@@ -23,6 +23,10 @@
 #include "bw_config.h"
 #include "bw2_config.h"
 
+// #include <bw_server.h>
+extern atomic_t srpc_credit_pool;
+extern atomic_t srpc_credit_used;
+
 /* time-series output */
 #define SBW_TS_OUT		false
 #define TS_BUF_SIZE_EXP		10
@@ -51,6 +55,7 @@ struct Event {
 	uint64_t delay;
 	int num_cores;
 	uint64_t avg_st;
+	uint64_t num_successes;
 };
 
 static struct Event events[TS_BUF_SIZE];
@@ -69,13 +74,15 @@ atomic_t srpc_num_drained;
 atomic_t srpc_num_active;
 
 /* global credit pool */
-atomic_t srpc_credit_pool;
+// moving definition to runtime/sched.c for breakwater parking
+// atomic_t srpc_credit_pool;
 
 /* timestamp of the latest credit pool update */
 uint64_t srpc_last_cp_update;
 
 /* global credit used */
-atomic_t srpc_credit_used;
+// moving definition to runtime/sched.c for breakwater parking
+// atomic_t srpc_credit_used;
 
 /* downstream credit for multi-hierarchy */
 atomic_t srpc_credit_ds;
@@ -146,6 +153,8 @@ atomic64_t srpc_stat_credit_tx_;
 atomic64_t srpc_stat_req_rx_;
 atomic64_t srpc_stat_req_dropped_;
 atomic64_t srpc_stat_resp_tx_;
+// tracking throughput
+atomic64_t srpc_successes_;
 
 #if SBW_TS_OUT
 static void printRecord()
@@ -157,12 +166,12 @@ static void printRecord()
 
 	for (i = 0; i < TS_BUF_SIZE; ++i) {
 		struct Event *event = &events[i];
-		fprintf(ts_out, "%lu,%d,%d,%d,%d,%d,%d,%lu,%d,%lu\n",
+		fprintf(ts_out, "%lu,%d,%d,%d,%d,%d,%d,%lu,%d,%lu,%d\n",
 			event->timestamp, event->credit_pool,
 			event->credit_used, event->num_pending,
 			event->num_drained, event->num_active,
 			event->num_sess, event->delay,
-			event->num_cores, event->avg_st);
+			event->num_cores, event->avg_st, event->num_successes);
 	}
 	fflush(ts_out);
 }
@@ -174,14 +183,16 @@ static void record(int credit_pool, uint64_t delay)
 
 	event->timestamp = microtime();
 	event->credit_pool = credit_pool;
-	event->credit_used = atomic_read(&srpc_credit_used[0]);
-	event->num_pending = atomic_read(&srpc_num_pending[0]);
-	event->num_drained = atomic_read(&srpc_num_drained[0]);
-	event->num_active = atomic_read(&srpc_num_active[0]);
-	event->num_sess = atomic_read(&srpc_num_sess[0]);
+	event->credit_used = atomic_read(&srpc_credit_used);
+	event->num_pending = atomic_read(&srpc_num_pending);
+	event->num_drained = atomic_read(&srpc_num_drained);
+	event->num_active = atomic_read(&srpc_num_active);
+	event->num_sess = atomic_read(&srpc_num_sess);
 	event->delay = delay;
 	event->num_cores = runtime_active_cores();
-	event->avg_st = atomic_read(&srpc_avg_st[0]);
+	event->avg_st = atomic_read(&srpc_avg_st);
+	event->num_successes = atomic64_read(&srpc_successes_);
+	atomic64_write(&srpc_successes_, 0); // clear every time. Going to remove record that's not on the RTT
 
 	if (nextIndex == 0)
 		printRecord();
@@ -255,6 +266,7 @@ static int srpc_send_completion_vector(struct sbw_session *s,
 	int nrhdr = 0;
 	int i;
 	ssize_t ret = 0;
+	int temp_successes = 0;
 
 	bitmap_for_each_set(slots, SBW_MAX_WINDOW, i) {
 		struct sbw_ctx *c = s->slots[i];
@@ -265,6 +277,7 @@ static int srpc_send_completion_vector(struct sbw_session *s,
 		if (!c->cmn.drop) {
 			len = c->cmn.resp_len;
 			buf = c->cmn.resp_buf;
+			temp_successes++;
 		} else {
 			len = c->cmn.req_len;
 			buf = c->cmn.req_buf;
@@ -305,6 +318,7 @@ static int srpc_send_completion_vector(struct sbw_session *s,
 #endif
 	atomic_sub_and_fetch(&srpc_num_pending, nrhdr);
 	atomic64_fetch_and_add(&srpc_stat_resp_tx_, nrhdr);
+	atomic64_fetch_and_add(&srpc_successes_, temp_successes);
 
 	if (unlikely(ret < 0))
 		return ret;
@@ -573,7 +587,7 @@ static void wakeup_drained_session(int num_session)
 		num_session--;
 	}
 }
-
+// Only actually runs through its code every RTT, even though it's called more often. See first if conditional
 static void srpc_update_credit_pool()
 {
 	uint64_t now = microtime();
@@ -624,9 +638,10 @@ static void srpc_handle_req_drop(uint64_t qus)
 	new_cp = decr_credit_pool(qus);
 	atomic_write(&srpc_credit_pool, new_cp);
 
-#if SBW_TS_OUT
-	record(new_cp, qus);
-#endif
+// #if SBW_TS_OUT
+// 	record(new_cp, qus);
+// #endif
+// TODO decide if we need this.
 }
 
 static void srpc_worker(void *arg)
@@ -1182,6 +1197,27 @@ uint64_t sbw_stat_resp_tx()
 {
 	return atomic64_read(&srpc_stat_resp_tx_);
 }
+
+// caladan-overload-control
+
+// int get_breakwater_srpc_credit_used() {
+// 	return atomic_read(&srpc_credit_used);
+// }
+
+// void notify_breakwater_parking(int* old_C_issued, int* breakwater_park_target) {
+// 	int curr_cores = runtime_active_cores();
+// 	int credit_pool = atomic_read(&srpc_credit_pool);
+// 	// this minimum for credits (max cores) is used throughout breakwater implementation
+// 	int new_credit_pool = (int) (SBW_CORE_PARK_TARGET * (credit_pool - (credit_pool / curr_cores)));
+// 	new_credit_pool = MAX(runtime_max_cores(), new_credit_pool);
+// 	*old_C_issued = atomic_read(&srpc_credit_used);
+// 	atomic_write(&srpc_credit_pool, new_credit_pool);
+// 	*breakwater_park_target = credit_pool - new_credit_pool;
+// }
+
+// void notify_breakwater_found_work(int restore) {
+// 	atomic_fetch_and_add(&srpc_credit_pool, restore);
+// }
 
 struct srpc_ops sbw_ops = {
 	.srpc_enable		= sbw_enable,
