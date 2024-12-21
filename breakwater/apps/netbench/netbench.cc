@@ -46,6 +46,8 @@ constexpr uint16_t kBarrierPort = 41;
 const struct crpc_ops *crpc_ops;
 const struct srpc_ops *srpc_ops;
 
+#define ENABLE_DOWNLOAD_ALL_TASKS			 false
+
 namespace {
 
 using namespace std::chrono;
@@ -84,6 +86,21 @@ constexpr uint64_t kNumDupClient = 32;
 
 std::vector<double> offered_loads;
 double offered_load;
+
+// for shorter exp duration, 4 seconds total
+std::vector<std::pair<double, uint64_t>> rates = {{400000, 2500000}, {1400000, 500000}, {850000, 500000}, 
+                                                  {1400000, 500000}};
+
+// std::vector<std::pair<double, uint64_t>> rates = {{875000, 4000000}};
+
+// std::vector<std::pair<double, uint64_t>> rates = {{400000, 4500000}, {1400000, 500000}, {850000, 1500000}, 
+//                                                   {1400000, 500000}, {400000, 1000000}};
+
+/// ERIC
+// 0: steady state
+// 1: load shift
+int experiment_type = 0;
+/// END ERIC
 
 static SyntheticWorker *workers[NCPU];
 
@@ -485,24 +502,25 @@ void RpcServer(struct srpc_ctx *ctx) {
 
   // Perform the synthetic work.
   uint64_t workn = ntoh64(in->work_iterations);
-  uint64_t hash = ntoh64(in->hash);
+  // uint64_t hash = ntoh64(in->hash);  // unused without mutex stuff
   int core_id = get_current_affinity();
   SyntheticWorker *w = workers[core_id];
-  int stype = ctx->s->session_type;
+  // int stype = ctx->s->session_type; // seems unused
 
-  int midx;
+  // int midx;
 
-  if (hash % 1000 < 200) midx = 0;
-  else midx = 1;
+  // if (hash % 1000 < 200) midx = 0;
+  // else midx = 1;
 
   if (workn != 0) {
-    if (mutex_lock_if_uncongested(&shared_mutex[midx])) {
-      workers[get_current_affinity()]->Work(workn);
-      mutex_unlock(&shared_mutex[midx]);
-    } else {
-      ctx->drop = true;
-      return;
-    }
+    w->Work(workn);
+    // if (mutex_lock_if_uncongested(&shared_mutex[midx])) {
+    //   workers[get_current_affinity()]->Work(workn);
+    //   mutex_unlock(&shared_mutex[midx]);
+    // } else {
+    //   ctx->drop = true;
+    //   return;
+    // }
   }
 
   // Craft a response.
@@ -981,6 +999,10 @@ std::vector<work_unit> RunExperiment(
   uint64_t offered = 0;
   uint64_t client_drop = 0;
 
+  // ERIC
+  std::vector<work_unit> client_drop_tasks;
+  // END ERIC
+
   for (int i = 0; i < threads; ++i) {
     auto &v = *samples[i];
     double throughput;
@@ -998,7 +1020,11 @@ std::vector<work_unit> RunExperiment(
     client_drop += std::count_if(v.begin(), v.end(), [](const work_unit &s) {
       return (s.duration_us == 0);
     });
-
+    // ERIC
+    std::copy_if(v.begin(), v.end(), std::back_inserter(client_drop_tasks), [](const work_unit &s) {
+                          return (s.duration_us == 0);
+                        });
+    // END ERIC
     // Remove local drops
     v.erase(std::remove_if(v.begin(), v.end(),
                         [](const work_unit &s) {
@@ -1025,6 +1051,25 @@ std::vector<work_unit> RunExperiment(
 
     w.insert(w.end(), v.begin(), v.end());
   }
+
+  // ERIC
+  // sort my vector (if possible), and outfile it
+  #if ENABLE_DOWNLOAD_ALL_TASKS
+  std::ofstream client_drop_tasks_file;
+  client_drop_tasks_file.open ("client_drop_tasks.csv");
+  client_drop_tasks_file << "start_us,work_us,duration_us,tsc,server_queue,server_time" << std::endl;
+  client_drop_tasks_file << std::setprecision(8) << std::fixed;
+  for (unsigned int i = 0; i < client_drop_tasks.size(); ++i) {
+    client_drop_tasks_file << client_drop_tasks[i].start_us << "," << client_drop_tasks[i].work_us << ","
+                           << int(client_drop_tasks[i].duration_us) << "," << client_drop_tasks[i].tsc << ","
+                           << client_drop_tasks[i].server_queue << "," << client_drop_tasks[i].server_time << std::endl;
+  }
+  client_drop_tasks_file.close();
+  std::cout << "offered: " << offered << std::endl;
+  std::cout << "resps: " << resps << std::endl;
+  std::cout << "elapsed: " << elapsed_ << std::endl;
+  #endif
+  // END ERIC
 
   // Report results.
   if (csr) {
@@ -1165,11 +1210,66 @@ void PrintStatResults(std::vector<work_unit> w, struct cstat *cs,
     reject_p50 = rejected[(reject_cnt - 1) * 0.5].duration_us;
     reject_p99 = rejected[(reject_cnt - 1) * 0.99].duration_us;
   }
+  // ERIC
+  std::vector<work_unit> server_drop_tasks;
+  std::copy_if(w.begin(), w.end(), std::back_inserter(server_drop_tasks), [](const work_unit &s) {
+                        return !s.success;
+                      });
+  // sort this once I know the the other fields are valid
+  // std::sort(server_drop_tasks.begin(), server_drop_tasks.end(), [](const work_unit &s1, const work_unit &s2) {
+  //   return s1.start_us < s2.start_us;
+  // });
+  #if ENABLE_DOWNLOAD_ALL_TASKS
+  std::ofstream server_drop_tasks_file;
+  server_drop_tasks_file.open ("server_drop_tasks.csv");
+  server_drop_tasks_file << "start_us,work_us,duration_us,tsc,server_queue,server_time" << std::endl;
+  server_drop_tasks_file << std::setprecision(8) << std::fixed;
+  for (unsigned int i = 0; i < server_drop_tasks.size(); ++i) {
+    server_drop_tasks_file << server_drop_tasks[i].start_us << "," << server_drop_tasks[i].work_us << ","
+                           << int(server_drop_tasks[i].duration_us) << "," << server_drop_tasks[i].tsc << ","
+                           << server_drop_tasks[i].server_queue << "," << server_drop_tasks[i].server_time << std::endl;
+  }
+  server_drop_tasks_file.close();
+  #endif
+  // END ERIC
 
   w.erase(std::remove_if(w.begin(), w.end(),
 			 [](const work_unit &s) {
 			   return !s.success;
 	}), w.end());
+
+  ///// ERIC
+  // ordering by start times
+  std::sort(w.begin(), w.end(), [](const work_unit &s1, const work_unit &s2) {
+    return s1.start_us < s2.start_us;
+  });
+  
+  /*
+  work unit struct:
+    double start_us, work_us, duration_us;
+    // duration_us is calculated from two ints, so it is always an int
+    int hash;
+    bool success;
+    bool is_monster;
+    uint64_t credit;
+    uint64_t tsc;
+    uint32_t cpu;
+    uint64_t server_queue;
+    uint64_t server_time;
+    uint64_t timing;
+  */
+  #if ENABLE_DOWNLOAD_ALL_TASKS
+  std::ofstream all_tasks_file;
+  all_tasks_file.open ("all_tasks.csv");
+  all_tasks_file << "start_us,work_us,duration_us,tsc,server_queue,server_time" << std::endl;
+  all_tasks_file << std::setprecision(8) << std::fixed;
+  for (unsigned int i = 0; i < w.size(); ++i) {
+    all_tasks_file << w[i].start_us << "," << w[i].work_us << "," << int(w[i].duration_us) << ","
+                   << w[i].tsc << "," << w[i].server_queue << "," << w[i].server_time << std::endl;
+  }
+  all_tasks_file.close();
+  #endif
+  ///// END ERIC
 
   std::sort(w.begin(), w.end(), [](const work_unit &s1, const work_unit &s2) {
     return s1.duration_us < s2.duration_us;
@@ -1309,6 +1409,69 @@ void PrintStatResults(std::vector<work_unit> w, struct cstat *cs,
            << std::flush;
 }
 
+void LoadShiftExperiment(int threads, double service_time) {
+  struct sstat ss;
+  struct cstat_raw csr;
+  struct cstat cs;
+  double elapsed;
+
+  memset(&csr, 0, sizeof(csr));
+
+  std::vector<work_unit> w = RunExperiment(threads, &csr, &ss, &elapsed,[=] {
+    std::mt19937 rg(rand());
+    std::mt19937 wg(rand());
+    std::exponential_distribution<double> wd(1.0 / service_time);
+    std::vector<work_unit> w_temp;
+    uint64_t last_us = 0;
+    for (auto &r : rates) {
+      double rate = r.first / (double) total_agents;
+      std::exponential_distribution<double> rd(
+          1.0 / (1000000.0 / (rate / static_cast<double>(threads))));
+      auto work = GenerateWork(std::bind(rd, rg), std::bind(wd, wg), last_us,
+                               last_us + r.second, false);
+      last_us = work.back().start_us;
+      w_temp.insert(w_temp.end(), work.begin(), work.end());
+    }
+    return w_temp;
+  },
+  [=] {
+    std::mt19937 rg(rand());
+    std::mt19937 wg(rand());
+    std::exponential_distribution<double> wd(1.0 / service_time);
+    std::vector<work_unit> w_temp;
+    uint64_t last_us = 0;
+    for (auto &r : rates) {
+      double rate = r.first / (double) total_agents;
+      std::exponential_distribution<double> rd(
+          1.0 / (1000000.0 / (rate / static_cast<double>(threads))));
+      auto work = GenerateWork(std::bind(rd, rg), std::bind(wd, wg), last_us,
+                               last_us + r.second, true);
+      last_us = work.back().start_us;
+      w_temp.insert(w_temp.end(), work.begin(), work.end());
+    }
+    return w_temp;
+  });
+
+  if (b) {
+    if (!b->EndExperiment(w, &csr)) return;
+  }
+
+  cs = cstat{csr.offered_rps,
+             csr.rps,
+             csr.goodput,
+             csr.min_percli_tput,
+             csr.max_percli_tput,
+             static_cast<double>(csr.ecredit_rx) / elapsed * 1000000,
+             static_cast<double>(csr.cupdate_tx) / elapsed * 1000000,
+             static_cast<double>(csr.resp_rx) / elapsed * 1000000,
+             static_cast<double>(csr.req_tx) / elapsed * 1000000,
+             static_cast<double>(csr.credit_expired) / elapsed * 1000000,
+             static_cast<double>(csr.req_dropped) / elapsed * 1000000};
+
+  // Print the results.
+  PrintStatResults(w, &cs, &ss);
+}
+
 void SteadyStateExperiment(int threads, double offered_rps,
                            double service_time) {
   struct sstat ss;
@@ -1377,8 +1540,12 @@ void AgentHandler(void *arg) {
 
   calculate_rates();
 
-  for (double i : offered_loads) {
-    SteadyStateExperiment(threads, i, st);
+  if (experiment_type == 1) {
+    LoadShiftExperiment(threads, st);
+  } else {
+    for (double i : offered_loads) {
+      SteadyStateExperiment(threads, i, st);
+    }
   }
 }
 
@@ -1399,9 +1566,18 @@ void ClientHandler(void *arg) {
   /* Print Header */
   PrintHeader(std::cout);
 
-  for (double i : offered_loads) {
-    SteadyStateExperiment(threads, i, st);
+  // for (double i : offered_loads) {
+  //   SteadyStateExperiment(threads, i, st);
+  //   rt::Sleep(1000000);
+  // }
+  if (experiment_type == 1) {
+    LoadShiftExperiment(threads, st);
     rt::Sleep(1000000);
+  } else {
+    for (double i : offered_loads) {
+      SteadyStateExperiment(threads, i, st);
+      rt::Sleep(1000000);
+    }
   }
 
   pos = json_out.tellp();
@@ -1443,7 +1619,7 @@ void print_seq_usage() {
 void print_client_usage() {
   std::cerr << "usage: [alg] [cfg_file] client [nclients] "
       << "[service_us] [service_dist] [slo] [nagents] "
-      << "[offered_load] [server_ip #1] [nconn #1] ...\n"
+      << "[offered_load] [experiment_type] [server_ip #1] [nconn #1] ...\n"
       << "\talg: overload control algorithms (breakwater/seda/dagor)\n"
       << "\tcfg_file: Shenango configuration file\n"
       << "\tnclients: the number of client connections\n"
@@ -1452,6 +1628,7 @@ void print_client_usage() {
       << "\tslo: RPC service level objective (in us)\n"
       << "\tnagents: the number of agents\n"
       << "\toffered_load: load geneated by client and agents in requests per second\n"
+      << "\texperiment_type: 0 for steady state, 1 for load shift\n"
       << "\tserver_ip: server IP address\n"
       << "\tnconn: the number of parallel connection to the server"
       << std::endl;
@@ -1508,13 +1685,15 @@ int main(int argc, char *argv[]) {
     }
   } else if (cmd.compare("agent") == 0) {
     // Agent
-    if (argc < 5 || StringToAddr(argv[4], &master.ip)) {
-      std::cerr << "usage: [alg] [cfg_file] agent [client_ip]\n"
+    if (argc < 6 || StringToAddr(argv[4], &master.ip)) {
+      std::cerr << "usage: [alg] [cfg_file] agent [client_ip] [experiment_type]\n"
 	        << "\talg: overload control algorithms (breakwater/seda/dagor)\n"
 		<< "\tcfg_file: Shenango configuration file\n"
-		<< "\tclient_ip: Client IP address" << std::endl;
+		<< "\tclient_ip: Client IP address\n"
+    << "\texperiment_type: 0 for steady state, 1 for load shift" << std::endl;
       return -EINVAL;
     }
+    experiment_type = std::stoi(argv[5], nullptr, 0);
 
     ret = runtime_init(argv[2], AgentHandler, NULL);
     if (ret) {
@@ -1620,7 +1799,7 @@ int main(int argc, char *argv[]) {
     return -EINVAL;
   }
 
-  if (argc < 11) {
+  if (argc < 12) {
     print_client_usage();
     return -EINVAL;
   }
@@ -1644,8 +1823,15 @@ int main(int argc, char *argv[]) {
   slo = std::stoi(argv[7], nullptr, 0);
   total_agents += std::stoi(argv[8], nullptr, 0);
   offered_load = std::stod(argv[9], nullptr);
+  experiment_type = std::stoi(argv[10], nullptr, 0);
 
-  num_servers = argc - 10;
+  /*
+    ERIC
+    going to modify this to 11, and insert my loadshift param BEFORE this weird server_ip + conns listing
+
+    hopefully keeps behavior the same in case I ever want to use this feature. 
+  */
+  num_servers = argc - 11; // does this make any sense?
   if (num_servers % 2 != 0) {
     print_client_usage();
     return -EINVAL;
@@ -1657,19 +1843,25 @@ int main(int argc, char *argv[]) {
 	      << std::endl;
     num_servers = 16;
   }
-
+/// ERIC
+  if (num_servers != 1) {
+    std::cerr << "[Error] num_servers is not equal to 1. Unsure if what happens if it isn't equal to 1"
+              << std::endl;
+    return -EINVAL;
+  }
+/// END ERIC
   for(i = 0; i < num_servers; ++i) {
     int nconn_;
 
-    ret = StringToAddr(argv[10+2*i], &raddr[i].ip);
+    ret = StringToAddr(argv[11+2*i], &raddr[i].ip);
     if (ret) {
-      std::cerr << "[Error] Cannot parse server IP:" << argv[10+2*i]
+      std::cerr << "[Error] Cannot parse server IP:" << argv[11+2*i]
 	        << std::endl;
       return -EINVAL;
     }
     raddr[i].port = kNetbenchPort;
 
-    nconn_ = std::stoi(argv[11+2*i], nullptr, 0);
+    nconn_ = std::stoi(argv[12+2*i], nullptr, 0);
     if (nconn_ > 16) {
       std::cerr << "[Warning] the number of parallel connection exceeds 16."
 	        << std::endl;

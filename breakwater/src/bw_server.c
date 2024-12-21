@@ -55,6 +55,7 @@ struct Event {
 	uint64_t delay;
 	int num_cores;
 	uint64_t avg_st;
+	uint64_t num_successes;
 };
 
 static struct Event events[TS_BUF_SIZE];
@@ -152,6 +153,8 @@ atomic64_t srpc_stat_credit_tx_;
 atomic64_t srpc_stat_req_rx_;
 atomic64_t srpc_stat_req_dropped_;
 atomic64_t srpc_stat_resp_tx_;
+// tracking throughput
+atomic64_t srpc_successes_;
 
 #if SBW_TS_OUT
 static void printRecord()
@@ -163,12 +166,12 @@ static void printRecord()
 
 	for (i = 0; i < TS_BUF_SIZE; ++i) {
 		struct Event *event = &events[i];
-		fprintf(ts_out, "%lu,%d,%d,%d,%d,%d,%d,%lu,%d,%lu\n",
+		fprintf(ts_out, "%lu,%d,%d,%d,%d,%d,%d,%lu,%d,%lu,%d\n",
 			event->timestamp, event->credit_pool,
 			event->credit_used, event->num_pending,
 			event->num_drained, event->num_active,
 			event->num_sess, event->delay,
-			event->num_cores, event->avg_st);
+			event->num_cores, event->avg_st, event->num_successes);
 	}
 	fflush(ts_out);
 }
@@ -188,6 +191,8 @@ static void record(int credit_pool, uint64_t delay)
 	event->delay = delay;
 	event->num_cores = runtime_active_cores();
 	event->avg_st = atomic_read(&srpc_avg_st);
+	event->num_successes = atomic64_read(&srpc_successes_);
+	atomic64_write(&srpc_successes_, 0); // clear every time. Going to remove record that's not on the RTT
 
 	if (nextIndex == 0)
 		printRecord();
@@ -261,6 +266,7 @@ static int srpc_send_completion_vector(struct sbw_session *s,
 	int nrhdr = 0;
 	int i;
 	ssize_t ret = 0;
+	int temp_successes = 0;
 
 	bitmap_for_each_set(slots, SBW_MAX_WINDOW, i) {
 		struct sbw_ctx *c = s->slots[i];
@@ -271,6 +277,7 @@ static int srpc_send_completion_vector(struct sbw_session *s,
 		if (!c->cmn.drop) {
 			len = c->cmn.resp_len;
 			buf = c->cmn.resp_buf;
+			temp_successes++;
 		} else {
 			len = c->cmn.req_len;
 			buf = c->cmn.req_buf;
@@ -311,6 +318,7 @@ static int srpc_send_completion_vector(struct sbw_session *s,
 #endif
 	atomic_sub_and_fetch(&srpc_num_pending, nrhdr);
 	atomic64_fetch_and_add(&srpc_stat_resp_tx_, nrhdr);
+	atomic64_fetch_and_add(&srpc_successes_, temp_successes);
 
 	if (unlikely(ret < 0))
 		return ret;
@@ -579,7 +587,7 @@ static void wakeup_drained_session(int num_session)
 		num_session--;
 	}
 }
-
+// Only actually runs through its code every RTT, even though it's called more often. See first if conditional
 static void srpc_update_credit_pool()
 {
 	uint64_t now = microtime();
@@ -630,9 +638,10 @@ static void srpc_handle_req_drop(uint64_t qus)
 	new_cp = decr_credit_pool(qus);
 	atomic_write(&srpc_credit_pool, new_cp);
 
-#if SBW_TS_OUT
-	record(new_cp, qus);
-#endif
+// #if SBW_TS_OUT
+// 	record(new_cp, qus);
+// #endif
+// TODO decide if we need this.
 }
 
 static void srpc_worker(void *arg)

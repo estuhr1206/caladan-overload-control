@@ -366,6 +366,7 @@ static __noreturn __noinline void schedule(void)
 	int old_C_issued;
 	int current_C_issued;
 	int breakwater_park_target;
+	int issued_reduction_target;
 	bool notified_breakwater = false;
 
 	assert_spin_lock_held(&l->lock);
@@ -486,11 +487,17 @@ park:
 	// read current outstanding credits
 	if (cfg_breakwater_prevent_parks) {
 		current_C_issued = atomic_read(&srpc_credit_used);
-		if (!notified_breakwater && atomic_read(&runningks) == maxks && current_C_issued < (cfg_CORE_CREDIT_RATIO * maxks)) {
+		// && atomic_read(&runningks) == maxks && current_C_issued < (cfg_CORE_CREDIT_RATIO * maxks)
+		if (!notified_breakwater && current_C_issued < (cfg_CORE_CREDIT_RATIO * atomic_read(&runningks))) {
 			// overloaded and at max cores: we should not be parking or reducing credits
+			if (cfg_yield_requests_enabled && return_to_after_yield) {
+				return_to_after_yield = false;
+				iters++; // shouldn't happen unless a yield request sent us here
+				goto after_yield_requested;
+			}
 			goto again;
 		}
-		if (notified_breakwater && old_C_issued - current_C_issued >= breakwater_park_target) {
+		if (notified_breakwater && (old_C_issued - current_C_issued >= issued_reduction_target)) {
 			// allow park
 			notified_breakwater = false;
 			// log_info()
@@ -504,9 +511,14 @@ park:
 				old_C_issued = atomic_read(&srpc_credit_used);
 				atomic_write(&srpc_credit_pool, new_credit_pool);
 				breakwater_park_target = credit_pool - new_credit_pool;
+				issued_reduction_target = MIN(breakwater_park_target, old_C_issued);
 				notified_breakwater = true;
 			}
-			// iters++; // shouldn't happen unless a yield request sent us here
+			if (cfg_yield_requests_enabled && return_to_after_yield) {
+				return_to_after_yield = false;
+				iters++; // shouldn't happen unless a yield request sent us here
+				goto after_yield_requested;
+			}
 			goto again;
 		}
 	}
